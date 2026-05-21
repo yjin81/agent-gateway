@@ -1,20 +1,20 @@
-// harness/types.ts — AgentHarness interface + AgentRequest + AgentResponse
+// adapter/types.ts — AgentAdapter interface + AgentRequest + AgentResponse
 // This file is the SINGLE SOURCE OF TRUTH for these types.
 // sdk-ts/src/types.ts must be kept byte-identical to this file.
 // sdk-py/agent_gateway/types.py must be kept in sync (camelCase ↔ snake_case).
 
-// Re-export MediaItem from connectors so harness authors have a single import point.
+// Re-export MediaItem from connectors so adapter authors have a single import point.
 export type { MediaItem, Mention } from '../connectors/types.js'
 
 export interface AgentRequest {
   // ── Routing ──────────────────────────────────────────────────────────────
-  /** Stable session key — harness uses this for history / state storage. */
+  /** Stable session key — adapter uses this for history / state storage. */
   sessionKey: string
 
   // ── Message ──────────────────────────────────────────────────────────────
   /** Clean user text: mentions stripped, bot @mention removed. */
   message: string
-  /** Original unmodified text from the platform (for harness audit/debug). */
+  /** Original unmodified text from the platform (for adapter audit/debug). */
   messageRaw: string
   /** Inbound attachments (gateway downloads if the platform provides a URL). */
   media: import('../connectors/types.js').MediaItem[]
@@ -44,18 +44,18 @@ export interface AgentRequest {
   }
 
   // ── Interruption ──────────────────────────────────────────────────────────
-  /** Harness should honour this in its tool loop and return early when fired. */
+  /** Adapter should honour this in its tool loop and return early when fired. */
   abortSignal: AbortSignal
 
   // ── Callbacks ────────────────────────────────────────────────────────────
   /**
-   * Harness calls this during tool execution for live progress display.
+   * Adapter calls this during tool execution for live progress display.
    * MUST NOT throw — gateway absorbs all delivery errors silently (TODO-9).
    */
   progressCallback: (toolName: string, preview: string) => void
 
   /**
-   * Harness calls this to request user approval before executing a dangerous tool.
+   * Adapter calls this to request user approval before executing a dangerous tool.
    * Resolves 'approved' | 'denied' — denied includes timeout.
    */
   approvalCallback: (prompt: string) => Promise<'approved' | 'denied'>
@@ -70,12 +70,12 @@ export interface AgentResponse {
   interrupted: boolean
 }
 
-export interface AgentHarness {
+export interface AgentAdapter {
   run(request: AgentRequest): Promise<AgentResponse>
 
   /**
    * Optional lifecycle hook called when wasAutoReset = true.
-   * Harness should clear its per-session state.
+   * Adapter should clear its per-session state.
    */
   onSessionReset?: (sessionKey: string) => Promise<void>
 }

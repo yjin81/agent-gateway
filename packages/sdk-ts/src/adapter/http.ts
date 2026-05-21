@@ -1,8 +1,8 @@
-// sdk-ts/src/harness/http.ts — HTTPHarness for SDK consumers
+// sdk-ts/src/adapter/http.ts — HttpAdapter for SDK consumers
 
-import type { AgentHarness, AgentRequest, AgentResponse } from '../types.js'
+import type { AgentAdapter, AgentRequest, AgentResponse } from '../types.js'
 
-export class HTTPHarness implements AgentHarness {
+export class HttpAdapter implements AgentAdapter {
   constructor(
     private readonly endpointUrl: string,
     private readonly getToken?: () => Promise<string>,
@@ -24,7 +24,7 @@ export class HTTPHarness implements AgentHarness {
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '')
-      throw new Error(`HTTPHarness: upstream returned ${resp.status}: ${text}`)
+      throw new Error(`HttpAdapter: upstream returned ${resp.status}: ${text}`)
     }
 
     return resp.json() as Promise<AgentResponse>

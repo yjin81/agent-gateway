@@ -32,6 +32,9 @@ importers:
 
   packages/gateway:
     dependencies:
+      '@hono/node-server':
+        specifier: ^2.0.3
+        version: 2.0.3(hono@4.12.19)
       '@types/js-yaml':
         specifier: ^4.0.9
         version: 4.0.9
@@ -418,6 +421,12 @@ packages:
 
   '@grammyjs/types@3.27.3':
     resolution: {integrity: sha512-yUKMLliGsGbnxu96YUJ7km7B0zy4PzeH/Jvti5705R/LeKDMqkDV4DckMSt+OrliWQpTwQljHE0QLol5zgxBkg==}
+
+  '@hono/node-server@2.0.3':
+    resolution: {integrity: sha512-a0jV+/HRe3G5zjFID3zObAQFdkl6zpxTuqktdDDXS3MJKcrZIkB8OkLpNBlY/WXFqv2HF4a0takPej+aNFczWA==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      hono: ^4
 
   '@humanfs/core@0.19.2':
     resolution: {integrity: sha512-UhXNm+CFMWcbChXywFwkmhqjs3PRCmcSa/hfBgLIb7oQ5HNb1wS0icWsGtSAUNgefHeI+eBrA8I1fxmbHsGdvA==}
@@ -1603,6 +1612,10 @@ snapshots:
       levn: 0.4.1
 
   '@grammyjs/types@3.27.3': {}
+
+  '@hono/node-server@2.0.3(hono@4.12.19)':
+    dependencies:
+      hono: 4.12.19
 
   '@humanfs/core@0.19.2':
     dependencies:

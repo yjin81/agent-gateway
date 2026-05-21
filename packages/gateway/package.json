@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@hono/node-server": "^2.0.3",
     "@types/js-yaml": "^4.0.9",
     "better-sqlite3": "^11.0.0",
     "croner": "^8.0.0",

@@ -33,11 +33,11 @@ export class ConnectorSendError extends GatewayError {}
 
 // ── Pipeline errors ────────────────────────────────────────────────────────
 
-/** harness.run() threw or returned a malformed response */
-export class HarnessError extends GatewayError {}
+/** adapter.run() threw or returned a malformed response */
+export class AdapterError extends GatewayError {}
 
-/** harness.run() did not return within the configured deadline */
-export class HarnessTimeoutError extends HarnessError {}
+/** adapter.run() did not return within the configured deadline */
+export class AdapterTimeoutError extends AdapterError {}
 
 /** Approval not received within approvalTimeoutMs */
 export class ApprovalTimeoutError extends GatewayError {}

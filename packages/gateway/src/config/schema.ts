@@ -37,27 +37,83 @@ const OpenAIApiConnectorSchema = BaseConnectorSchema.extend({
   bearerToken: z.string().optional(),
 })
 
+/**
+ * WeChat personal account connector via Tencent iLink Bot API.
+ * Credentials are obtained by running the QR login flow once and storing them
+ * in the gateway data directory. Use ${ENV_VAR} interpolation for the token.
+ *
+ * Required fields come from the iLink QR login response:
+ *   token      — bot_token from the confirmed QR login
+ *   ilinkBotId — ilink_bot_id (the bot's WeChat user ID, used as accountUserId)
+ *   baseUrl    — baseurl returned on login (region-specific iLink endpoint)
+ */
+const WechatConnectorSchema = BaseConnectorSchema.extend({
+  type: z.literal('wechat'),
+  /** Bearer token from the iLink QR login — supply via ${ENV_VAR} */
+  token: z.string().min(1),
+  /** The bot's own WeChat iLink user ID (ilink_bot_id from QR login response). Used to filter self-messages. */
+  ilinkBotId: z.string().min(1),
+  /** Region-specific iLink base URL from the QR login response. Default: https://ilinkai.weixin.qq.com */
+  baseUrl: z.string().url().default('https://ilinkai.weixin.qq.com'),
+  /** WeChat CDN base URL for encrypted media download/upload. Default: https://novac2c.cdn.weixin.qq.com/c2c */
+  cdnBaseUrl: z.string().url().default('https://novac2c.cdn.weixin.qq.com/c2c'),
+  /**
+   * "open" — accept DMs from anyone (default)
+   * "allowlist" — only accept DMs from ilinkUserIds listed in allowFrom
+   * "disabled" — no DMs
+   */
+  dmPolicy: z.enum(['open', 'allowlist', 'disabled']).default('open'),
+  /**
+   * "open" — accept group messages where the bot is @mentioned
+   * "disabled" — ignore all group messages (default)
+   */
+  groupPolicy: z.enum(['open', 'disabled']).default('disabled'),
+  /** Comma-separated iLink user IDs allowed when dmPolicy/groupPolicy = allowlist */
+  allowFrom: z.string().optional(),
+  /** Delay in ms between sequential message chunks. Default: 350 */
+  chunkDelayMs: z.number().int().min(0).default(350),
+})
+
 const ConnectorSchema = z.discriminatedUnion('type', [
   TelegramConnectorSchema,
   SlackConnectorSchema,
   TeamsConnectorSchema,
   OpenAIApiConnectorSchema,
+  WechatConnectorSchema,
 ])
 
-// ── Harness schemas ──────────────────────────────────────────────────────────
+// ── Adapter schemas ──────────────────────────────────────────────────────────
 
-const HttpHarnessSchema = z.object({
+const HttpAdapterSchema = z.object({
   type: z.literal('http'),
   url: z.string().url(),
   bearerTokenEnv: z.string().optional(),
+  /**
+   * Wire protocol used when posting to the adapter URL.
+   *
+   * "agent-request"     — POST AgentRequest JSON, expect AgentResponse JSON (default).
+   *                       Use this when the URL points to an agent server built with
+   *                       the agent-gateway SDK.
+   *
+   * "openai-responses"  — Translate AgentRequest → OpenAI Responses API format
+   *                       ({ input, model }), then parse the response output back to
+   *                       AgentResponse. Use this when the URL points directly to a
+   *                       Foundry / Azure OpenAI Responses endpoint.
+   */
+  protocol: z.enum(['agent-request', 'openai-responses']).default('agent-request'),
+  /**
+   * Model name sent in the "model" field when protocol = "openai-responses".
+   * Required for openai-responses; ignored for agent-request.
+   */
+  model: z.string().optional(),
 })
 
-const EmbeddedHarnessSchema = z.object({
+const EmbeddedAdapterSchema = z.object({
   type: z.literal('embedded'),
   module: z.string().min(1),
 })
 
-const HarnessSchema = z.discriminatedUnion('type', [HttpHarnessSchema, EmbeddedHarnessSchema])
+const AdapterSchema = z.discriminatedUnion('type', [HttpAdapterSchema, EmbeddedAdapterSchema])
 
 // ── Top-level gateway config ─────────────────────────────────────────────────
 
@@ -70,7 +126,7 @@ export const GatewayConfigSchema = z
         idleTimeoutMs: z.number().int().positive().default(3_600_000),
         pendingQueueCap: z.number().int().min(1).default(1),
         approvalTimeoutMs: z.number().int().positive().default(300_000),
-        harnessTimeoutMs: z.number().int().min(1_000).default(300_000),
+        adapterTimeoutMs: z.number().int().min(1_000).default(300_000),
         logLevel: z
           .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace'])
           .default('info'),
@@ -85,7 +141,7 @@ export const GatewayConfigSchema = z
       })
       .default({}),
 
-    harness: HarnessSchema,
+    adapter: AdapterSchema,
   })
   .superRefine((val, ctx) => {
     // Validate: each connector accountId must be unique.
@@ -117,4 +173,5 @@ export type TelegramConnectorConfig = z.infer<typeof TelegramConnectorSchema>
 export type SlackConnectorConfig = z.infer<typeof SlackConnectorSchema>
 export type TeamsConnectorConfig = z.infer<typeof TeamsConnectorSchema>
 export type OpenAIApiConnectorConfig = z.infer<typeof OpenAIApiConnectorSchema>
-export type HarnessConfig = z.infer<typeof HarnessSchema>
+export type WechatConnectorConfig = z.infer<typeof WechatConnectorSchema>
+export type AdapterConfig = z.infer<typeof AdapterSchema>

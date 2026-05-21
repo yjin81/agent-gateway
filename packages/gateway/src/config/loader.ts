@@ -1,7 +1,7 @@
 // config/loader.ts — Load, interpolate, and validate gateway.config.yaml
 
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { resolve, isAbsolute } from 'node:path'
 
 import { GatewayConfigSchema } from './schema.js'
 import type { GatewayConfig } from './schema.js'
@@ -59,13 +59,18 @@ export function validateConfig(raw: unknown): GatewayConfig {
 /**
  * Load YAML config from a file path, interpolate env vars, validate, and return.
  * Requires `js-yaml` installed. Throws ConfigValidationError on any failure.
+ *
+ * `gateway.dataDir` is resolved relative to the config file's directory so the
+ * gateway always finds its data regardless of the process working directory.
  */
 export async function loadConfigFile(filePath: string): Promise<GatewayConfig> {
+  const absFilePath = resolve(filePath)
+  const configDir = resolve(absFilePath, '..')
   let raw: unknown
   try {
     // Dynamic import of js-yaml to keep it optional at compile time.
     const jsYaml = await import('js-yaml')
-    const content = readFileSync(resolve(filePath), 'utf8')
+    const content = readFileSync(absFilePath, 'utf8')
     raw = jsYaml.load(content)
   } catch (err) {
     if (err instanceof ConfigValidationError) throw err
@@ -75,7 +80,12 @@ export async function loadConfigFile(filePath: string): Promise<GatewayConfig> {
     )
   }
   const interpolated = interpolateEnvVars(raw)
-  return validateConfig(interpolated)
+  const config = validateConfig(interpolated)
+  // Make dataDir absolute relative to the config file so it is CWD-independent.
+  if (!isAbsolute(config.gateway.dataDir)) {
+    config.gateway.dataDir = resolve(configDir, config.gateway.dataDir)
+  }
+  return config
 }
 
 /**

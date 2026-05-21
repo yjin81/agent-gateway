@@ -28,8 +28,8 @@ export async function handleCommand(
     case 'reset': {
       runRegistry.abort(sessionKey)
       sessionRegistry.resetSession(sessionKey)
-      if (deps.harness.onSessionReset != null) {
-        await deps.harness.onSessionReset(sessionKey).catch((err) => {
+      if (deps.adapter.onSessionReset != null) {
+        await deps.adapter.onSessionReset(sessionKey).catch((err) => {
           logger.warn({ sessionKey, err }, 'handleCommand: onSessionReset threw')
         })
       }

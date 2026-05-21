@@ -1,65 +1,88 @@
 # Agent Gateway
 
-A personal experiment. The goal: run any AI agent on any messaging platform without rewriting platform glue each time, and make it easy for multiple agents to work together as a team.
+A self-hostable runtime that connects any AI agent to any messaging platform. It handles all the platform infrastructure once — session routing, concurrency, typing indicators, commands, reliable delivery — so you can focus on agent logic.
 
----
-
-## Why
-
-Building agents is interesting. Wiring them to different platforms, testing them in a chat UI, comparing how different frameworks feel end-to-end — that's where most of the iteration time goes, and most of it is boilerplate.
-
-This gateway handles the platform layer once. An agent just implements one interface (`AgentHarness`) and gets connected to whatever platform is configured. Swap the agent, keep the platform. Swap the platform, keep the agent. This idea is inspired by OpenClaw and Hermes Agent infra.
-
-The second motivation is multi-agent teams. Because every agent in the gateway gets a stable session key and a shared message bus, one agent can invoke another by sending a message to its session. No special orchestration framework needed — agents coordinate through the same turn pipeline used for human messages.
+Inspired by the architectural convergence of two production systems (hermes-agent and OpenClaw) that independently arrived at the same six load-bearing decisions. See [`docs/agent-gateway-design.md`](docs/agent-gateway-design.md) for the full design.
 
 ---
 
 ## How it works
 
 ```
-User (Telegram / OpenAI API / ...) 
-  → Connector (normalize message)
-  → Core Pipeline (session, concurrency, commands)
-  → AgentHarness.run(request)
-  → Response delivered back to user
+Platform (WeChat / Telegram / OpenAI API / ...)
+  → Connector        normalize raw event → NormalizedMessage
+  → Core Pipeline    session · concurrency · commands · audit log
+  → AgentAdapter     run(request) → response
+  → Connector        deliver response back to platform
 ```
 
 Three layers:
 
-1. **Connectors** — one per platform. Each converts the platform's raw events into a `NormalizedMessage` and handles outbound delivery. v0 has Telegram and an OpenAI API compatibility endpoint.
+1. **Connectors** — one per platform. Translate the platform's raw events into `NormalizedMessage` and handle outbound delivery. v0 ships three: WeChat (iLink), Telegram, and an OpenAI API compatibility endpoint.
 
-2. **Core** — platform-agnostic. Owns session routing, serial-per-session execution (one turn at a time per chat), typing indicators, built-in commands (`/stop`, `/new`, `/approve`, `/deny`, etc.), and the audit log.
+2. **Core** — platform-agnostic. Owns the 6-stage turn pipeline, session registry (SQLite WAL), serial-per-session concurrency (one turn at a time per chat), typing indicators, built-in commands, and an append-only audit log.
 
-3. **Harness** — the agent. Anything that implements `run(request) → response` works. The gateway ships two built-ins: `HTTPHarness` (forward to any HTTP endpoint) and `EmbeddedHarness` (in-process). The reference agent in this repo is a LangGraph ReAct agent served over FastAPI.
+3. **Adapter** — the agent. Anything that implements `run(request) → response`. Built-ins: `HttpAdapter` (forward to any HTTP endpoint) and `EmbeddedAdapter` (in-process).
 
 ---
 
-## Structure
+## Repository structure
 
 ```
 agent-gateway/
 ├── packages/
-│   ├── gateway/          # Runtime (TypeScript / Node.js 22)
-│   ├── sdk-ts/           # npm: @agent-gateway/sdk
-│   ├── sdk-py/           # PyPI: agent-gateway-sdk
-│   └── agent-reference/  # Reference LangGraph agent (Python / FastAPI)
+│   ├── gateway/              # Runtime (TypeScript / Node.js 22)
+│   │   └── src/
+│   │       ├── connectors/   # wechat/, telegram/, openai-api/
+│   │       ├── core/         # pipeline/, session/, commands/
+│   │       ├── adapter/      # http.ts, embedded.ts, types.ts
+│   │       └── config/       # schema.ts, loader.ts
+│   ├── sdk-ts/               # npm: @agent-gateway/sdk
+│   ├── sdk-py/               # PyPI: agent-gateway-sdk
+│   └── agent-reference/      # Reference LangGraph agent (Python / FastAPI)
 ├── docs/
-│   ├── agent-gateway-design.md   # Full design spec
-│   └── v0-planning.md            # v0 scope and acceptance criteria
-└── pnpm-workspace.yaml
+│   ├── agent-gateway-design.md   # Full architecture and pipeline spec
+│   ├── v0-planning.md            # v0 scope and acceptance criteria
+│   ├── connectors/               # Per-connector setup guides
+│   │   ├── wechat.md
+│   │   ├── telegram.md
+│   │   └── openai-api.md
+│   └── adapters/                 # Per-adapter setup guides
+│       ├── http.md
+│       ├── embedded.md
+│       └── reference-agent.md
+├── data/                         # Runtime data (gitignored)
+│   ├── .env                      # Secrets — never committed
+│   └── gateway.config.yaml       # Active config
+└── wechat_login.py               # WeChat iLink QR login script
 ```
 
 ---
 
-## Quickstart
+## Turn pipeline
 
-### Prerequisites
+A **turn** is one inbound message processed through to response delivery. The pipeline has 6 stages — all platform-agnostic after Stage 1:
+
+| Stage | Name | What it does |
+|---|---|---|
+| 1 | NORMALIZE | Connector parses raw event → `NormalizedMessage`; null → drop |
+| 2 | CLASSIFY | Detect bot-loop, commands, whether the agent was addressed |
+| 3 | IDENTIFY | Resolve or create `SessionRecord` for `sessionKey` |
+| 4 | CONCURRENCY GATE | Serial-per-session; abort active run if new message arrives |
+| 5 | DISPATCH | Build `AgentRequest`, call adapter, deliver response |
+| 6 | FINALIZE | Release run slot, write audit log, drain pending queue |
+
+---
+
+## Prerequisites
 
 - Node.js 22+
 - pnpm 10+
-- Python 3.11+ (for the reference agent)
-- A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- An OpenAI API key
+- Python 3.11+ (for the reference agent or `wechat_login.py`)
+
+---
+
+## Setup
 
 ### 1. Install
 
@@ -67,23 +90,91 @@ agent-gateway/
 pnpm install
 ```
 
-### 2. Configure
+### 2. Create the data directory
 
 ```sh
-mkdir -p data
-cp docs/gateway.config.example.yaml data/gateway.config.yaml
+mkdir data
 ```
 
-Edit `data/gateway.config.yaml` — it references secrets via `${ENV_VAR}` interpolation, never stores them directly.
+### 3. Configure the gateway
 
-Create `data/.env`:
+Create `data/gateway.config.yaml`. The file uses `${ENV_VAR}` interpolation — secrets are never stored in it directly.
+
+**Minimal example — WeChat + Azure Foundry agent:**
+
+```yaml
+gateway:
+  logLevel: info
+  adapterTimeoutMs: 60000
+
+http:
+  port: 3000
+
+connectors:
+  - type: wechat
+    accountId: wechat-personal
+    token: ${WECHAT_TOKEN}
+    ilinkBotId: ${WECHAT_ILINK_BOT_ID}
+    baseUrl: ${WECHAT_BASE_URL}
+    dmPolicy: open
+    groupPolicy: disabled
+
+adapter:
+  type: http
+  url: ${ADAPTER_URL}
+  bearerTokenEnv: AGENT_TOKEN
+  protocol: openai-responses
+  model: gpt-4.1
+```
+
+**Minimal example — Telegram + reference agent:**
+
+```yaml
+connectors:
+  - type: telegram
+    accountId: telegram-personal
+    token: ${TELEGRAM_BOT_TOKEN}
+
+adapter:
+  type: http
+  url: ${ADAPTER_URL}
+```
+
+All supported config fields are documented in [`packages/gateway/src/config/schema.ts`](packages/gateway/src/config/schema.ts).
+
+### 4. Create `data/.env`
+
+All secrets go here. You will load this file manually into your shell before starting the gateway (Step 7).
 
 ```env
-TELEGRAM_BOT_TOKEN=your-bot-token
-OPENAI_API_KEY=your-openai-key
+# WeChat iLink (obtain via wechat_login.py — see docs/connectors/wechat.md)
+WECHAT_TOKEN=your-ilink-bot-token
+WECHAT_ILINK_BOT_ID=your-ilink-bot-id@im.bot
+WECHAT_BASE_URL=https://ilinkai.weixin.qq.com
+
+# Azure Foundry / Azure OpenAI (short-lived JWT — refresh before starting)
+AGENT_TOKEN=eyJ...
+
+# HTTP adapter endpoint (Foundry Responses endpoint or your agent server)
+ADAPTER_URL=https://<your-foundry-endpoint>/protocols/openai/responses?api-version=2025-11-15-preview
+
+# Telegram
+TELEGRAM_BOT_TOKEN=your-telegram-bot-token
 ```
 
-### 3. Start the reference agent
+### 5. Connector-specific setup
+
+Each connector has its own credentials and login flow:
+
+| Connector | Setup guide |
+|---|---|
+| WeChat (iLink) | [`docs/connectors/wechat.md`](docs/connectors/wechat.md) |
+| Telegram | [`docs/connectors/telegram.md`](docs/connectors/telegram.md) |
+| OpenAI API compat | [`docs/connectors/openai-api.md`](docs/connectors/openai-api.md) |
+
+### 6. Start the reference agent (optional)
+
+If you are using `HttpAdapter` pointed at the reference LangGraph agent:
 
 ```sh
 cd packages/agent-reference
@@ -92,85 +183,169 @@ python -m agent_reference.server
 # Listening on http://localhost:8080
 ```
 
-### 4. Start the gateway
+### 7. Start the gateway
 
-```sh
-cd packages/gateway
-pnpm dev
+The gateway does **not** auto-load `.env`. You must load it into the shell first, then set `GATEWAY_DATA_DIR` so the gateway can locate the config file regardless of working directory.
+
+**PowerShell:**
+
+```powershell
+# Load secrets from data/.env into the current shell
+Get-Content data\.env | Where-Object { $_ -match '^[A-Z]' } | ForEach-Object {
+    $parts = $_ -split '=', 2
+    Set-Item "env:$($parts[0])" $parts[1]
+}
+
+# Point the gateway at the data directory (use the absolute path)
+$env:GATEWAY_DATA_DIR = "$PWD\data"
+
+cd packages\gateway
+pnpm exec tsx src/index.ts
 ```
 
-Send your bot a message on Telegram. The reference agent (LangGraph ReAct with `get_current_time` and `calculator` tools) responds.
+**bash:**
+
+```sh
+# Load secrets from data/.env into the current shell
+set -a && source data/.env && set +a
+
+# Point the gateway at the data directory (use the absolute path)
+export GATEWAY_DATA_DIR="$PWD/data"
+
+cd packages/gateway
+pnpm exec tsx src/index.ts
+```
+
+The gateway resolves its config from `$GATEWAY_DATA_DIR/gateway.config.yaml`. Alternatively, set `GATEWAY_CONFIG_PATH` to an absolute path to the config file directly.
+
+> **Note:** `pnpm dev` (defined as `tsx src/index.ts`) does the same thing but requires the same env setup first — it does not load `.env` or set `GATEWAY_DATA_DIR` automatically.
 
 ---
 
-## Implementing your own agent
+## Adapter interface
 
-Implement the `AgentHarness` interface. Python example using the SDK:
+Anything that implements `run(request) → response` is a valid adapter.
 
-```python
-from agent_gateway import AgentHarness, AgentRequest, AgentResponse
-from fastapi import FastAPI
-
-class MyAgent(AgentHarness):
-    async def run(self, request: AgentRequest) -> AgentResponse:
-        # Load history, call your model, save history — all yours.
-        reply = f"Echo: {request.message}"
-        return AgentResponse(text=reply, media=[], interrupted=False)
-```
-
-Serve it on any port, point `harness.url` at it in the config, done.
-
-TypeScript SDK:
+**TypeScript:**
 
 ```ts
-import type { AgentHarness, AgentRequest, AgentResponse } from '@agent-gateway/sdk'
+import type { AgentAdapter, AgentRequest, AgentResponse } from '@agent-gateway/sdk'
 
-export class MyAgent implements AgentHarness {
+export class MyAgent implements AgentAdapter {
   async run(request: AgentRequest): Promise<AgentResponse> {
+    // Load history for request.sessionKey, call your model, save history.
     return { text: `Echo: ${request.message}`, media: [], interrupted: false }
   }
 }
 ```
 
----
+**Python (via the SDK):**
 
-## Multi-agent teams
+```python
+from agent_gateway import AgentAdapter, AgentRequest, AgentResponse
+from fastapi import FastAPI
 
-Each agent in the gateway has a stable `sessionKey`. An agent can invoke another by calling the gateway's OpenAI API compat endpoint with the target agent's session ID in `X-Session-Id`. The same pipeline — session isolation, concurrency control, command handling — applies to agent-to-agent turns exactly as it does to human-to-agent turns.
+class MyAgent(AgentAdapter):
+    async def run(self, request: AgentRequest) -> AgentResponse:
+        return AgentResponse(text=f"Echo: {request.message}", media=[], interrupted=False)
+```
 
-No special orchestration layer. Agents are just callers.
+Point `adapter.url` at your HTTP server in `gateway.config.yaml`. Done.
+
+### AgentRequest fields
+
+| Field | Type | Description |
+|---|---|---|
+| `sessionKey` | `string` | Stable routing key — use this for history storage |
+| `message` | `string` | Clean user text (bot mention stripped) |
+| `messageRaw` | `string` | Original unmodified platform text |
+| `media` | `MediaItem[]` | Inbound attachments |
+| `isNew` | `bool` | First message in this session |
+| `wasAutoReset` | `bool` | Session was idle-reset since last turn |
+| `platform.name` | `string` | `"wechat"` / `"telegram"` / `"openai-api"` |
+| `platform.chatKind` | `string` | `"dm"` / `"group"` / `"channel"` |
+| `platform.userId` | `string` | Sender's platform user ID |
+| `platform.userName` | `string` | Sender's display name |
+| `abortSignal` | `AbortSignal` | Check in your tool loop — user sent `/stop` |
+
+### HttpAdapter protocols
+
+`HttpAdapter` supports two wire formats via `protocol` in the config:
+
+| Value | Use when |
+|---|---|
+| `agent-request` (default) | Pointing at an SDK-based agent server (`POST /run` → `AgentRequest` / `AgentResponse`) |
+| `openai-responses` | Pointing directly at Azure Foundry / Azure OpenAI Responses API endpoint |
 
 ---
 
 ## Built-in commands
 
-These are intercepted by the gateway before reaching any agent:
+Intercepted by the gateway before reaching any agent:
 
 | Command | What it does |
 |---|---|
-| `/stop` | Abort the current turn |
-| `/new` or `/reset` | Start a fresh session (agent clears its history) |
+| `/stop` | Abort the active run |
+| `/new` or `/reset` | Start a fresh session |
 | `/approve` | Approve a pending agent action |
 | `/deny` | Deny a pending agent action |
 | `/status` | Show session state |
 | `/help` | List all commands |
+| `/retry` | Re-send the last user message |
 
 ---
 
 ## v0 scope
 
-| In scope | Out of scope (v1+) |
+What shipped in v0:
+
+| Layer | Component | Status |
+|---|---|---|
+| Connectors | WeChat (iLink) | Shipped |
+| Connectors | Telegram | Shipped |
+| Connectors | OpenAI API compat (`POST /v1/chat/completions`) | Shipped |
+| Core | Full 6-stage turn pipeline | Shipped |
+| Core | Session registry (SQLite WAL) | Shipped |
+| Core | Serial-per-session concurrency | Shipped |
+| Core | Typing indicators | Shipped |
+| Core | `send_with_retry` + `chunk_message` | Shipped |
+| Core | Approval flow (`/approve`, `/deny`) | Shipped |
+| Core | Idle-timeout reset | Shipped |
+| Core | Audit log | Shipped |
+| Core | Graceful shutdown | Shipped |
+| Core | Priority commands | Shipped |
+| Adapter | `HttpAdapter` (agent-request + openai-responses protocols) | Shipped |
+| Adapter | `EmbeddedAdapter` | Shipped |
+| Agent | Reference LangGraph agent (`packages/agent-reference`) | Shipped |
+
+Post-v0 (planned):
+
+| Feature | Notes |
 |---|---|
-| Telegram connector | Slack, Discord, Teams |
-| OpenAI API compat endpoint | Streaming responses |
-| HTTPHarness + EmbeddedHarness | Multi-harness routing |
-| Serial-per-session execution | Distributed / multi-instance |
-| Approval flow | Rich media delivery |
-| Python + TypeScript SDKs | Automated SDK code-gen |
+| Slack connector | Requires Socket Mode app token |
+| MS Teams connector | Requires Azure Bot registration |
+| Discord connector | Planned v1 |
+| Streaming responses | SSE / chunked transfer |
+| Multi-adapter routing | Per-connector or per-chat-type routing |
+| Cron turn source | Scheduled agent turns |
+| ACP server | VS Code / Zed / JetBrains integration |
+| Distributed session registry | Redis / Postgres backend for multi-replica |
 
 ---
 
 ## Design docs
 
-- [`docs/agent-gateway-design.md`](docs/agent-gateway-design.md) — full architecture, data models, pipeline spec, error handling strategy
-- [`docs/v0-planning.md`](docs/v0-planning.md) — v0 scope, acceptance criteria, reference agent spec
+- [`docs/agent-gateway-design.md`](docs/agent-gateway-design.md) — full architecture, data models, pipeline spec, error handling
+- [`docs/v0-planning.md`](docs/v0-planning.md) — v0 scope and acceptance criteria
+
+### Connectors
+
+- [`docs/connectors/wechat.md`](docs/connectors/wechat.md) — WeChat iLink: QR login, config reference, DM/group policy, token refresh
+- [`docs/connectors/telegram.md`](docs/connectors/telegram.md) — Telegram: BotFather setup, poll vs. webhook, group addressing
+- [`docs/connectors/openai-api.md`](docs/connectors/openai-api.md) — OpenAI API compat: session continuity, client examples, limitations
+
+### Adapters
+
+- [`docs/adapters/http.md`](docs/adapters/http.md) — `HttpAdapter`: both wire protocols (`agent-request` and `openai-responses`), bearer token refresh, error handling, implementing a compatible server
+- [`docs/adapters/embedded.md`](docs/adapters/embedded.md) — `EmbeddedAdapter`: in-process TypeScript agents, full `AgentRequest`/`AgentResponse` field reference, `abortSignal`, approval flow
+- [`docs/adapters/reference-agent.md`](docs/adapters/reference-agent.md) — Reference LangGraph agent: setup, HTTP contract, extending with tools, building your own agent

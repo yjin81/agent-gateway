@@ -13,9 +13,9 @@
 
 ## 1. Goal
 
-v0 is the first end-to-end working version of Agent Gateway. Its goal is to validate the full stack — platform connector → turn pipeline → harness → response delivery — with the minimal surface area needed to be genuinely useful and to serve as a trustworthy foundation for subsequent connectors and harness implementations.
+v0 is the first end-to-end working version of Agent Gateway. Its goal is to validate the full stack — platform connector → turn pipeline → adapter → response delivery — with the minimal surface area needed to be genuinely useful and to serve as a trustworthy foundation for subsequent connectors and adapter implementations.
 
-v0 is **not** a demo. It must be correct within its declared scope: correct concurrency, reliable delivery, clean error handling, and a reference agent that harness authors can copy and extend.
+v0 is **not** a demo. It must be correct within its declared scope: correct concurrency, reliable delivery, clean error handling, and a reference agent that adapter authors can copy and extend.
 
 ---
 
@@ -27,12 +27,12 @@ v0 is **not** a demo. It must be correct within its declared scope: correct conc
 - Connection mechanism: long polling (`getUpdates`) — no public URL required, works on a developer laptop
 - Supported chat types: DM and group (with @mention detection)
 - Session key formulas: `v1:telegram:{accountId}:{conversation.id}` (DM), `v1:telegram:{accountId}:{conversation.id}:{sender.id}` (group)
-- Media: inbound images and voice messages passed through to harness as `MediaItem[]`; outbound text only (no media send in v0)
+- Media: inbound images and voice messages passed through to adapter as `MediaItem[]`; outbound text only (no media send in v0)
 - Library: `grammY`
 
 **Connector 2: OpenAI API Compatibility Layer**
 - Endpoint: `POST /v1/chat/completions` only
-- Input: standard OpenAI `messages[]` array; the last `user` message becomes `AgentRequest.message`; all prior `messages[]` entries are passed as `messageRaw` for the harness to use if it wishes; the `model` field is passed through in `platform.name`
+- Input: standard OpenAI `messages[]` array; the last `user` message becomes `AgentRequest.message`; all prior `messages[]` entries are passed as `messageRaw` for the adapter to use if it wishes; the `model` field is passed through in `platform.name`
 - Session key: `v1:openai-api:{accountId}:{clientSessionId}` where `clientSessionId` is taken from a custom request header `X-Session-Id` if provided, otherwise a random UUID generated per request
 - **Session continuity**: the OpenAI `/v1/chat/completions` protocol is inherently stateless — clients send the full message history in every request. For v0, the compat connector makes no attempt to reconstruct session continuity from request content. Clients that want persistent history across requests must supply a stable `X-Session-Id` header. Clients that do not will receive a fresh session on each request (consistent with how the OpenAI API itself behaves).
 - Output: non-streaming JSON response (`choices[0].message.content`) populated from `AgentResponse.text`; streaming (`stream: true`) is out of scope for v0
@@ -64,17 +64,19 @@ All six pipeline stages are implemented in full. No shortcuts.
 | Process completion turn source | ❌ Post-v0 |
 | ACP server (`/acp/*`) | ❌ Post-v0 |
 
-### Layer 3 — Harness
+### Layer 3 — adapter
 
-**`HTTPHarness`**: full implementation. This is the primary integration path for all Python harnesses.
+**v0 constraint: exactly one adapter per gateway instance.** All connectors route every message to the same single adapter. Multi-adapter routing (e.g. different adapters per connector or per chat type) is a post-v0 feature.
 
-**`EmbeddedHarness`**: full implementation. Used in tests and for TypeScript-native harnesses.
+**`HttpAdapter`**: full implementation. This is the primary integration path for all Python agents.
+
+**`EmbeddedAdapter`**: full implementation. Used in tests and for TypeScript-native agents.
 
 ---
 
 ## 3. Reference Agent — `packages/agent-reference`
 
-v0 ships a working reference agent in the monorepo at `packages/agent-reference`. It is implemented in Python using LangGraph and LangChain, exposes an HTTP endpoint consumed by `HTTPHarness`, and is designed to be the canonical starting point for harness authors.
+v0 ships a working reference agent in the monorepo at `packages/agent-reference`. It is implemented in Python using LangGraph and LangChain, exposes an HTTP endpoint consumed by `HttpAdapter`, and is designed to be the canonical starting point for adapter authors.
 
 ### What it is
 
@@ -112,7 +114,7 @@ packages/agent-reference/
 
 ### HTTP contract
 
-The reference agent implements the `AgentHarness` HTTP contract (design spec Section 6):
+The reference agent implements the `AgentAdapter` HTTP contract (design spec Section 6):
 
 ```
 POST /run
@@ -158,7 +160,7 @@ Via environment variables (loaded by `config.py` using Pydantic `BaseSettings`):
 │  Layer 2: Gateway Core (TypeScript / Node.js)               │
 │                                                             │
 │  Turn pipeline → SessionRegistry (SQLite)                   │
-│  RunSlot concurrency → HTTPHarness                          │
+│  RunSlot concurrency → HttpAdapter                          │
 └────────────────────────┬────────────────────────────────────┘
                          │ POST /run  (AgentRequest JSON)
                          │ ◄────────  (AgentResponse JSON)
@@ -171,7 +173,7 @@ Via environment variables (loaded by `config.py` using Pydantic `BaseSettings`):
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Both connectors share the same gateway core and harness process. A message from Telegram and a request from the OpenAI API compat layer go through identical pipeline stages and reach the same agent — differentiated only by `AgentRequest.platform.name` and their `sessionKey` prefix.
+Both connectors share the same gateway core and adapter process. A message from Telegram and a request from the OpenAI API compat layer go through identical pipeline stages and reach the same agent — differentiated only by `AgentRequest.platform.name` and their `sessionKey` prefix. This single-adapter constraint is explicit in v0; multi-adapter routing is deferred to a later version.
 
 ---
 
@@ -183,14 +185,15 @@ Both connectors share the same gateway core and harness process. A message from 
 | MS Teams connector | CJS interop complexity; requires Azure Bot registration — deferred to v1 |
 | Discord connector | Low priority relative to Telegram for initial validation |
 | `POST /v1/responses` (OpenAI Responses protocol) | Streaming and stateful response objects add complexity; `/v1/chat/completions` covers the majority of clients |
-| Streaming responses (`stream: true`) | Requires SSE / chunked transfer; significant added complexity in both gateway and harness |
-| Media send (outbound) | Gateway receives and forwards inbound media to harness; harness returning `media[]` in response is not delivered in v0 |
+| Streaming responses (`stream: true`) | Requires SSE / chunked transfer; significant added complexity in both gateway and adapter |
+| Media send (outbound) | Gateway receives and forwards inbound media to adapter; adapter returning `media[]` in response is not delivered in v0 |
 | Approval flow in reference agent | Reference agent tools are safe; no approval-triggering tool is included |
 | Cron and process completion turn sources | No scheduler needed for v0 validation |
 | `/model`, `/voice`, `/resume`, `/title`, `/background` commands | Session and config commands are post-v0 |
 | ACP server | VS Code / Zed / JetBrains integration — post-v0 |
 | `sdk-py` publication to PyPI | The package exists in the monorepo; publishing is deferred until the API stabilises post-v0 |
 | Multi-profile / multi-instance | Single instance only for v0 |
+| Multi-adapter routing | One adapter per gateway instance in v0; all connectors share the same adapter. Per-connector or per-chat routing is post-v0 |
 | Health check endpoint (`GET /healthz`) | Added in v1 before AKS/ACA deployment |
 
 ---
@@ -201,15 +204,15 @@ v0 is considered complete when all of the following pass:
 
 ### Gateway core
 
-- [ ] A message sent to the Telegram bot in a DM is routed to the harness and the response is delivered back to the same chat
+- [ ] A message sent to the Telegram bot in a DM is routed to the adapter and the response is delivered back to the same chat
 - [ ] A message sent to the Telegram bot in a group (with @mention) is routed correctly; a message without @mention is silently observed (not dispatched)
-- [ ] A `POST /v1/chat/completions` request returns a valid OpenAI-format JSON response populated from the harness
-- [ ] Sending a second message while the harness is processing the first aborts the first and queues the second
+- [ ] A `POST /v1/chat/completions` request returns a valid OpenAI-format JSON response populated from the adapter
+- [ ] Sending a second message while the adapter is processing the first aborts the first and queues the second
 - [ ] Sending a third message while the second is pending replaces the pending item and sends the supersede notification to the user
 - [ ] `/stop` aborts an active run; the user receives no response for the aborted turn
 - [ ] `/new` resets the session; the next turn has `isNew: true` and `wasAutoReset: true`
 - [ ] A session idle for longer than `idleTimeoutMs` sets `wasAutoReset: true` on the next turn
-- [ ] Typing indicator is active during harness processing and stops when the response is delivered
+- [ ] Typing indicator is active during adapter processing and stops when the response is delivered
 - [ ] Gateway restarts Telegram long polling after a simulated network disconnect
 
 ### Reference agent
@@ -224,5 +227,5 @@ v0 is considered complete when all of the following pass:
 ### Error handling
 
 - [ ] An invalid `gateway.config.yaml` causes a startup error with a clear message and exit code 1
-- [ ] A harness that returns a 500 results in an error message to the user, not a silent failure
-- [ ] A harness that takes longer than `harnessTimeoutMs` results in a timeout message to the user and the session slot is released
+- [ ] An adapter that returns a 500 results in an error message to the user, not a silent failure
+- [ ] An adapter that takes longer than `adapterTimeoutMs` results in a timeout message to the user and the session slot is released

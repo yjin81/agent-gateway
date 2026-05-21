@@ -1,7 +1,7 @@
 """types.py — AgentRequest, AgentResponse as Pydantic BaseModel.
 
 Wire format is camelCase; Python attributes are snake_case.
-Kept in sync with packages/gateway/src/harness/types.ts (TODO-10).
+Kept in sync with packages/gateway/src/adapter/types.ts (TODO-10).
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ class ToolPolicy(BaseModel):
 
 
 class AgentRequest(BaseModel):
-    """Parsed form of the JSON body POSTed to the harness endpoint by the gateway."""
+    """Parsed form of the JSON body POSTed to the adapter endpoint by the gateway."""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -63,12 +63,12 @@ class AgentRequest(BaseModel):
     tool_policy: ToolPolicy = Field(alias="toolPolicy")
 
     # abortSignal, progressCallback, approvalCallback are NOT present in the
-    # wire format — they are gateway-side concerns. Harnesses implement
+    # wire format — they are gateway-side concerns. Adapters implement
     # cooperative cancellation by checking a flag or using asyncio.
 
 
 class AgentResponse(BaseModel):
-    """Response returned by the harness to the gateway."""
+    """Response returned by the adapter to the gateway."""
 
     model_config = ConfigDict(populate_by_name=True)
 

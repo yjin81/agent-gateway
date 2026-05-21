@@ -7,7 +7,7 @@
 3. [Architecture Overview](#3-architecture-overview)
 4. [Layer 1 — Platform Connectors](#4-layer-1--platform-connectors)
 5. [Layer 2 — Agent Gateway Core](#5-layer-2--agent-gateway-core)
-6. [Layer 3 — Agent Harness Interface](#6-layer-3--agent-harness-interface)
+6. [Layer 3 — Agent Adapter Interface](#6-layer-3--agent-adapter-interface)
 7. [Data Models](#7-data-models)
 8. [Turn Sources](#8-turn-sources)
 9. [Deployment Considerations](#9-deployment-considerations)
@@ -31,7 +31,7 @@ The core insight is that building an agent for Telegram, Discord, Slack, or What
 1. **Platform integration**: Each messaging platform has a private, incompatible protocol, message schema, and identity system. These cannot be unified; they must each be implemented individually.
 2. **Agent integration**: Every AI agent, regardless of framework, needs the same runtime infrastructure: a stable session identity, concurrency protection, interrupt handling, and reliable response delivery.
 
-Agent Gateway solves both problems in a layered architecture. The gateway is a pure message router — it does not manage conversation history, compose prompts, or make reasoning decisions. Those belong to the agent harness.
+Agent Gateway solves both problems in a layered architecture. The gateway is a pure message router — it does not manage conversation history, compose prompts, or make reasoning decisions. Those belong to the Agent Adapter.
 
 ---
 
@@ -39,7 +39,7 @@ Agent Gateway solves both problems in a layered architecture. The gateway is a p
 
 ### Target Users
 
-- **Agent developers** who have built an agent using any framework (LangGraph, AutoGen, CrewAI, custom harness, or a hosted endpoint like Foundry Invocations) and want to deploy it to messaging platforms without building platform integrations themselves.
+- **Agent developers** who have built an agent using any framework (LangGraph, AutoGen, CrewAI, custom adapter, or a hosted endpoint like Foundry Invocations) and want to deploy it to messaging platforms without building platform integrations themselves.
 - **Platform teams** who want to expose a shared agent infrastructure to multiple teams, each with their own agent implementation.
 - **Enterprise deployments** that need to support multiple messaging channels from a single agent backend.
 
@@ -47,7 +47,7 @@ Agent Gateway solves both problems in a layered architecture. The gateway is a p
 
 | Without Agent Gateway | With Agent Gateway |
 |---|---|
-| Build Telegram, Discord, Slack adapters separately for each agent | Implement one `AgentHarness`, get 20+ platforms |
+| Build Telegram, Discord, Slack adapters separately for each agent | Implement one `AgentAdapter`, get 20+ platforms |
 | Re-implement session routing, typing, interrupts per agent | Platform-agnostic infrastructure handled once |
 | Each platform requires custom mention parsing and chat-type logic | Unified `NormalizedMessage` contract |
 | Approval flows require platform-specific UI code | Gateway handles `/approve`/`/deny` natively |
@@ -110,11 +110,11 @@ Agent Gateway is **self-hostable and framework-agnostic**. It does not dictate h
                            │    isNew, wasAutoReset,
                            │    toolPolicy, abortSignal }
 ┌──────────────────────────┴──────────────────────────────────────┐
-│                   Layer 3: Agent Harness                        │
+│                   Layer 3: Agent Adapter                        │
 │                                                                 │
-│  EmbeddedHarness   LangGraphHarness   HTTPHarness   ...         │
+│  EmbeddedAdapter   LangGraphHarness   HttpAdapter   ...         │
 │                                                                 │
-│  Harness owns:                                                  │
+│  adapter owns:                                                  │
 │    load history for sessionKey                                  │
 │    compose system prompt                                        │
 │    run model + tools                                            │
@@ -124,7 +124,7 @@ Agent Gateway is **self-hostable and framework-agnostic**. It does not dictate h
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Key boundary**: The gateway passes structured facts to the harness. The harness decides how to express them as prompts. The gateway never writes prose into the model's context.
+**Key boundary**: The gateway passes structured facts to the adapter. The adapter decides how to express them as prompts. The gateway never writes prose into the model's context.
 
 ---
 
@@ -181,7 +181,7 @@ Example formulas by platform and chat type:
 When a connector's key formula changes (version bump from `v1:` to `v2:`):
 
 1. **Old sessions are not automatically migrated.** They remain in the `SessionRegistry` under their `v1:` keys and will idle-timeout naturally.
-2. **No history is lost** — history is owned by the harness, keyed on `sessionKey`. If the harness needs to carry history forward, it must implement its own migration by reading old keys and writing new ones before the gateway restarts.
+2. **No history is lost** — history is owned by the adapter, keyed on `sessionKey`. If the adapter needs to carry history forward, it must implement its own migration by reading old keys and writing new ones before the gateway restarts.
 3. **The migration procedure**:
    - Bump the version prefix in the connector's `deriveSessionKey()` implementation.
    - Optionally, run a one-time migration script before restart:  
@@ -339,15 +339,15 @@ Mention {
 |---|---|
 | `sessionKey` | Derived by connector's `deriveSessionKey()`, consumed by Layer 2 |
 | `isCommand` / `commandName` | Decided by Layer 2 (gateway knows its own command registry) |
-| `system_context` string | Assembled by agent harness — not a message field |
-| `history` | Loaded by agent harness — not in the message |
+| `system_context` string | Assembled by Agent Adapter — not a message field |
+| `history` | Loaded by Agent Adapter — not in the message |
 | Platform capability flags | Belong on connector account config, not individual messages |
 
 ---
 
 ## 5. Layer 2 — Agent Gateway Core
 
-The gateway core is a **pure message router**. It does not manage conversation history, compose prompts, inject skills, or make reasoning decisions. Those belong to the agent harness.
+The gateway core is a **pure message router**. It does not manage conversation history, compose prompts, inject skills, or make reasoning decisions. Those belong to the Agent Adapter.
 
 What it owns:
 - Routing messages from platforms to the right session
@@ -421,7 +421,7 @@ NormalizedMessage (from connector)
 │                                                       │
 │  5a. start keep_typing loop                           │
 │  5b. build AgentRequest (structured facts, no prose)  │
-│  5c. call AgentHarness.run(request)                   │
+│  5c. call AgentAdapter.run(request)                   │
 │  5d. stop typing (in finally)                         │
 │  5e. send response text via send_with_retry           │
 │  5f. send response media[] via connector.send         │
@@ -452,7 +452,7 @@ NormalizedMessage (from connector)
 
 #### Turn outcomes
 
-| Outcome | When | Typing? | Harness called? | Audit logged? |
+| Outcome | When | Typing? | adapter called? | Audit logged? |
 |---|---|---|---|---|
 | `dropped` | `normalize` null, `isSelf`, null sender | No | No | No |
 | `handled` | Priority or non-priority command | No | No | Yes |
@@ -475,22 +475,22 @@ RunSlot {
 Rules:
 - **Priority commands** (`/stop`, `/approve`, `/deny`, `/new`, `/reset`): classified at Stage 2 as `isPriorityCommand`; bypass Stage 4 entirely; dispatch inline; return `handled`.
 - **Busy + media burst**: enqueue to `pendingQueue` without signaling interrupt; processed as batch when run completes.
-- **Busy + normal message**: call `abortCtrl.abort()` to signal the harness; enqueue to `pendingQueue`.
+- **Busy + normal message**: call `abortCtrl.abort()` to signal the adapter; enqueue to `pendingQueue`.
 - **Queue overflow (queue at cap and new message arrives)**: the existing pending item is **replaced** by the new message. The sender of the superseded message receives a platform notification: `"⚠ Your previous message was not processed because a newer message arrived. Please resend if needed."` This keeps behavior simple and predictable for v0 — the user always sees the freshest intent processed next.
 - **Race prevention**: `RunSlot.state` set to `"running"` synchronously before any async work — same event-loop tick as the idle check.
 - **Pending drain**: at Stage 6, if `pendingQueue` non-empty, dequeue next and re-enter Stage 4. Loop, not recursion.
 
 #### Approval flow
 
-When the agent harness requests approval mid-turn (e.g. before executing a dangerous tool):
+When the Agent Adapter requests approval mid-turn (e.g. before executing a dangerous tool):
 
-1. Harness signals gateway via `approvalCallback(prompt)`
+1. adapter signals gateway via `approvalCallback(prompt)`
 2. Gateway pauses the typing indicator (so the user can type)
 3. Gateway sends approval request message to the platform chat
 4. Stage 5 suspends in-place awaiting an `ApprovalEvent`, subject to `approvalTimeoutMs`
 5. User sends `/approve` or `/deny` — classified as priority command at Stage 2, dispatched inline
 6. Command handler resolves the `ApprovalEvent`
-7. Stage 5 resumes; harness continues or aborts the tool
+7. Stage 5 resumes; adapter continues or aborts the tool
 
 If the user does not respond within `approvalTimeoutMs`, the `ApprovalEvent` is resolved as `denied`. The gateway sends `"Approval request expired — action was not taken."` to the platform chat, releases the `RunSlot`, and records the turn as `outcome: handled`.
 
@@ -519,7 +519,7 @@ SessionRecord {
 
 **What the gateway tracks**: session existence, timing, and the active run slot.
 
-**What the gateway does NOT track**: conversation history, message content, model state. Those belong to the harness.
+**What the gateway does NOT track**: conversation history, message content, model state. Those belong to the adapter.
 
 #### Idle-timeout reset
 
@@ -527,7 +527,7 @@ Configurable per connector (or globally). When `now - lastTouchedAt > idleTimeou
 - `SessionRecord.wasAutoReset` is set to `true`
 - `isNew` is set to `true`
 - `lastTouchedAt` is reset
-- The harness is informed via `wasAutoReset: true` on the next `AgentRequest` — it decides what to do (clear history, notify user, etc.)
+- The adapter is informed via `wasAutoReset: true` on the next `AgentRequest` — it decides what to do (clear history, notify user, etc.)
 
 The gateway does not clear history itself — it doesn't own history.
 
@@ -561,14 +561,14 @@ Splits long responses into platform-compliant chunks:
 
 ### 5.5 Command System
 
-The gateway intercepts slash commands before they reach the harness. Commands are resolved by canonical name with aliases.
+The gateway intercepts slash commands before they reach the adapter. Commands are resolved by canonical name with aliases.
 
 #### Priority commands (bypass concurrency gate)
 
 | Command | Action |
 |---|---|
 | `/stop` | Abort the active run via `abortCtrl.abort()` |
-| `/new`, `/reset` | Set `wasAutoReset = true`, `isNew = true` on session; harness clears its own state on next turn |
+| `/new`, `/reset` | Set `wasAutoReset = true`, `isNew = true` on session; adapter clears its own state on next turn |
 | `/approve` | Resolve pending `ApprovalEvent` with `approved` |
 | `/deny` | Resolve pending `ApprovalEvent` with `denied` |
 
@@ -616,7 +616,7 @@ AuditEntry {
 }
 ```
 
-The audit log records **what went through the gateway**, not message content. It is not conversation history and is not fed back to the harness.
+The audit log records **what went through the gateway**, not message content. It is not conversation history and is not fed back to the adapter.
 
 ### 5.7 Gateway Lifecycle
 
@@ -638,21 +638,21 @@ Per-connector watcher detects `isHealthy() = false` and reconnects with exponent
 
 ---
 
-## 6. Layer 3 — Agent Harness Interface
+## 6. Layer 3 — Agent Adapter Interface
 
 ### Purpose
 
-The `AgentHarness` interface is the contract between the gateway and any agent implementation. The gateway calls `run()` once per turn and delivers whatever the harness returns. Everything inside `run()` — history loading, prompt assembly, model calls, tool execution, state persistence — belongs entirely to the harness.
+The `AgentAdapter` interface is the contract between the gateway and any agent implementation. The gateway calls `run()` once per turn and delivers whatever the adapter returns. Everything inside `run()` — history loading, prompt assembly, model calls, tool execution, state persistence — belongs entirely to the adapter.
 
 ### Interface
 
 ```typescript
-interface AgentHarness {
+interface AgentAdapter {
   run(request: AgentRequest): Promise<AgentResponse>
 
   // Optional lifecycle hooks
   onSessionReset?(sessionKey: string): Promise<void>
-    // Called when wasAutoReset = true — harness should clear its state
+    // Called when wasAutoReset = true — adapter should clear its state
 }
 ```
 
@@ -663,11 +663,11 @@ The gateway passes only what it knows. It does not compose prose or load history
 ```typescript
 type AgentRequest = {
   // Routing
-  sessionKey:   string         // stable key — harness uses this for storage lookup
+  sessionKey:   string         // stable key — adapter uses this for storage lookup
 
   // Message
   message:      string         // clean user text (mentions stripped, bot mention removed)
-  messageRaw:   string         // original unmodified text from the platform (for harness audit/debug use)
+  messageRaw:   string         // original unmodified text from the platform (for adapter audit/debug use)
   media:        MediaItem[]    // inbound attachments (gateway downloaded if needed)
 
   // Session state flags
@@ -690,11 +690,11 @@ type AgentRequest = {
   }
 
   // Interruption
-  abortSignal:  AbortSignal    // harness should check this in its tool loop
+  abortSignal:  AbortSignal    // adapter should check this in its tool loop
 
   // Callbacks
   progressCallback: (toolName: string, preview: string) => void
-    // harness calls this during tool execution for live progress display
+    // adapter calls this during tool execution for live progress display
 }
 ```
 
@@ -708,33 +708,33 @@ type AgentResponse = {
 }
 ```
 
-**Media is declared explicitly** — the gateway does not parse `text` for image URLs or `MEDIA:` tags. The harness signals what it wants delivered via `media[]`. The gateway routes by `MediaItem.kind`.
+**Media is declared explicitly** — the gateway does not parse `text` for image URLs or `MEDIA:` tags. The adapter signals what it wants delivered via `media[]`. The gateway routes by `MediaItem.kind`.
 
-**`messageRaw` is passed for transparency** — the harness may use it for audit, debug, or to infer addressing style (e.g., direct mention vs. reply). The gateway makes no decisions based on it.
+**`messageRaw` is passed for transparency** — the adapter may use it for audit, debug, or to infer addressing style (e.g., direct mention vs. reply). The gateway makes no decisions based on it.
 
-### What the harness owns
+### What the adapter owns
 
-| Concern | Harness responsibility |
+| Concern | adapter responsibility |
 |---|---|
 | Conversation history | Load for `sessionKey`, save after turn |
 | System prompt | Compose from `PlatformContext` facts + own config |
-| Skills / personality | Inject into system prompt as harness sees fit |
+| Skills / personality | Inject into system prompt as adapter sees fit |
 | Context compression | Run when approaching context limit |
 | Model selection | Use `AgentRequest` facts to choose; gateway passes `toolPolicy` constraints only |
 | Tool execution | Full tool loop, respecting `abortSignal` and `toolPolicy` |
 | State persistence | After turn — keyed on `sessionKey` |
-| Onboarding / reset notices | Harness decides how to express `isNew`/`wasAutoReset` to the model |
+| Onboarding / reset notices | adapter decides how to express `isNew`/`wasAutoReset` to the model |
 
-### Built-in Harness Implementations
+### Built-in adapter implementations
 
-#### `EmbeddedHarness`
+#### `EmbeddedAdapter`
 Wraps an in-process agent (any Python/JS framework). Maintains a per-`sessionKey` agent cache to preserve prompt caching. Runs synchronous agents in a thread pool executor.
 
-#### `HTTPHarness`
+#### `HttpAdapter`
 Forwards `AgentRequest` to any HTTP endpoint. Enables Foundry Invocations, ACA/AKS hosted agents, or any microservice.
 
 ```typescript
-class HTTPHarness implements AgentHarness {
+class HttpAdapter implements AgentAdapter {
   constructor(private endpointUrl: string, private getToken?: () => Promise<string>) {}
 
   async run(request: AgentRequest): Promise<AgentResponse> {
@@ -755,7 +755,7 @@ class HTTPHarness implements AgentHarness {
 
 #### `LangGraphHarness` (example)
 ```typescript
-class LangGraphHarness implements AgentHarness {
+class LangGraphHarness implements AgentAdapter {
   constructor(private graph: CompiledGraph, private store: HistoryStore) {}
 
   async run(request: AgentRequest): Promise<AgentResponse> {
@@ -773,7 +773,7 @@ class LangGraphHarness implements AgentHarness {
 
 ```typescript
 const gateway = new GatewayRunner({
-  harness: new MyHarness(),
+  adapter: new MyAdapter(),
   connectors: [telegramConnector, slackConnector],
 })
 await gateway.start()
@@ -804,7 +804,7 @@ Maintained by `SessionRegistry`.
 | `createdAt` | `number` | Unix ms of first message |
 | `lastTouchedAt` | `number` | Unix ms of last dispatched turn |
 | `isNew` | `bool` | True until first dispatched turn completes |
-| `wasAutoReset` | `bool` | Set by idle-timeout; cleared after harness acknowledges |
+| `wasAutoReset` | `bool` | Set by idle-timeout; cleared after adapter acknowledges |
 | `runSlot` | `RunSlot` | Concurrency state |
 
 ### `RunSlot`
@@ -840,7 +840,7 @@ Full definitions in Section 6.
 
 ## 8. Turn Sources
 
-A **turn** is any event that causes the harness to be invoked. There are four sources, entering the pipeline at different stages.
+A **turn** is any event that causes the adapter to be invoked. There are four sources, entering the pipeline at different stages.
 
 | Source | Enters at | Has sender? | Session key source | Delivery target |
 |---|---|---|---|---|
@@ -869,7 +869,7 @@ The gateway must run as a **persistent process** — not serverless. Category A 
 - **Filesystem**: config, connector credentials, image/audio cache
 - Persistent volume required for container deployments
 
-The gateway does **not** own conversation history storage. That is the harness's responsibility.
+The gateway does **not** own conversation history storage. That is the adapter's responsibility.
 
 ### Multi-Instance
 
@@ -886,8 +886,8 @@ Each instance has its own config, session registry, and connector credentials. C
 
 Split-process deployment:
 - **Gateway process**: platform connectivity, runs in Docker
-- **Harness process**: full filesystem access, runs locally or on a separate host
-- Connected via `HTTPHarness` pointing at the harness's HTTP endpoint
+- **adapter process**: full filesystem access, runs locally or on a separate host
+- Connected via `HttpAdapter` pointing at the adapter's HTTP endpoint
 
 ---
 
@@ -901,11 +901,11 @@ Split-process deployment:
 | Teams / M365 | Via MS Teams connector | Native |
 | Persistent connections | Yes (always-on) | No (15 min idle timeout) |
 | Approval flows | Native | Not supported |
-| Agent framework | Any (via `AgentHarness`) | Any (via `invoke_handler`) |
+| Agent framework | Any (via `AgentAdapter`) | Any (via `invoke_handler`) |
 | Concurrent sessions | Unlimited (single node) | 50 (preview quota) |
 | Hosting | Self-managed | Managed (Foundry) |
 
-**Recommended split**: Gateway handles platform connectivity; `HTTPHarness` forwards to a Foundry Invocations endpoint for agent reasoning. Gateway's platform breadth + Foundry's managed hosting.
+**Recommended split**: Gateway handles platform connectivity; `HttpAdapter` forwards to a Foundry Invocations endpoint for agent reasoning. Gateway's platform breadth + Foundry's managed hosting.
 
 ### vs. Microsoft Bot Framework (retired)
 
@@ -918,17 +918,17 @@ Agent Gateway does not attempt to abstract the platform layer — heterogeneity 
 ## 11. Roadmap Considerations
 
 ### Near-term
-- **`agent-gateway-sdk` package**: Extract `AgentHarness` interface + built-in implementations into a standalone installable package — no dependency on any specific gateway deployment
-- **`HTTPHarness` + Foundry integration**: First-class Entra token refresh for Foundry Invocations endpoints
+- **`agent-gateway-sdk` package**: Extract `AgentAdapter` interface + built-in implementations into a standalone installable package — no dependency on any specific gateway deployment
+- **`HttpAdapter` + Foundry integration**: First-class Entra token refresh for Foundry Invocations endpoints
 - **Connector registry**: Configuration-driven connector activation without code changes
 
 ### Medium-term
-- **Connector expansion**: WeChat public account, Messenger, LINE, Viber
-- **Multi-harness routing**: Route different commands or chat types to different `AgentHarness` implementations within the same gateway instance
-- **Structured streaming**: Harness emits structured delta events (text chunk, tool start, tool result) rather than a final `AgentResponse` — gateway streams to platform in real time
+- **Connector expansion**: WeChat personal account (iLink) already shipped in v0; Messenger, LINE, Viber planned
+- **Multi-adapter routing**: Route different commands or chat types to different `AgentAdapter` implementations within the same gateway instance
+- **Structured streaming**: adapter emits structured delta events (text chunk, tool start, tool result) rather than a final `AgentResponse` — gateway streams to platform in real time
 
 ### Long-term
-- **Foundry Connector integration**: If Foundry adds native Telegram/Slack/Discord connectors, `HTTPHarness` becomes the bridge — platform → Foundry → any harness
+- **Foundry Connector integration**: If Foundry adds native Telegram/Slack/Discord connectors, `HttpAdapter` becomes the bridge — platform → Foundry → any adapter
 
 ---
 
@@ -947,7 +947,7 @@ Agent Gateway is derived from two production systems that independently converge
 - **API compatibility**: `gateway/platforms/api_server.py` — OpenAI-compatible endpoint
 - **ACP adapter**: `acp_adapter/server.py`
 
-hermes-agent's `AIAgent` (`run_agent.py`) is the embedded agent that acts as an `EmbeddedHarness`. It owns history, prompt assembly, tools, and context compression.
+hermes-agent's `AIAgent` (`run_agent.py`) is the embedded agent that acts as an `EmbeddedAdapter`. It owns history, prompt assembly, tools, and context compression.
 
 ### OpenClaw (TypeScript)
 
@@ -969,7 +969,7 @@ Both systems independently arrived at:
 3. A **serial-per-session concurrency model** with an abort controller per active run
 4. A **single agent invocation entry point** that all dispatch paths funnel through
 5. A **cron service** using isolated sessions, separate from platform sessions
-6. The **agent harness owning history** — the gateway passes a session key, not history
+6. The **Agent Adapter owning history** — the gateway passes a session key, not history
 
 The convergence on these six decisions validates them as load-bearing architectural choices.
 
@@ -979,18 +979,18 @@ The convergence on these six decisions validates them as load-bearing architectu
 
 The following design questions are deferred until the v0 codebase is built and usable. They represent known gaps that do not block initial implementation but must be resolved before the gateway is considered production-ready for general use.
 
-### TODO-5: HTTPHarness Interrupt Semantics
+### TODO-5: HttpAdapter Interrupt Semantics
 
-**Issue**: `HTTPHarness` forwards `abortSignal` to `fetch()`, which cancels the HTTP connection. However, the remote agent process continues executing after the connection is dropped — it may waste compute and commit tool side effects that the gateway has already abandoned.
+**Issue**: `HttpAdapter` forwards `abortSignal` to `fetch()`, which cancels the HTTP connection. However, the remote agent process continues executing after the connection is dropped — it may waste compute and commit tool side effects that the gateway has already abandoned.
 
 **Work needed**:
-- Define an interrupt protocol for remote harnesses. Options:
+- Define an interrupt protocol for remote adapters. Options:
   - (a) A companion `DELETE /session/{sessionKey}/run` endpoint the gateway calls on `abortSignal` fire.
   - (b) Server-sent events (SSE) streaming response — gateway closes the stream; remote respects `Connection: close` as abort signal.
-- Update `HTTPHarness` implementation spec and the `AgentHarness` interface documentation.
-- Decide whether interrupt support is required or optional for conforming harness implementations.
+- Update `HttpAdapter` implementation spec and the `AgentAdapter` interface documentation.
+- Decide whether interrupt support is required or optional for conforming adapter implementations.
 
-**Blocking**: Not blocking for v0 (single-process `EmbeddedHarness` handles abort correctly). Becomes critical before `HTTPHarness` is used with long-running or side-effectful agents.
+**Blocking**: Not blocking for v0 (single-process `EmbeddedAdapter` handles abort correctly). Becomes critical before `HttpAdapter` is used with long-running or side-effectful agents.
 
 ---
 
@@ -1022,7 +1022,7 @@ The following design questions are deferred until the v0 codebase is built and u
 
 ### TODO-8: `AgentResponse.text` Markup Ownership
 
-**Issue**: `AgentResponse.text` is specified as "clean, no platform-specific syntax" but the canonical markup format is undefined. If the harness returns CommonMark, the connector must translate it to the platform's syntax (Telegram MarkdownV2, Discord Markdown, Slack mrkdwn). If translation is the harness's responsibility, cross-platform harnesses must know all platform syntaxes.
+**Issue**: `AgentResponse.text` is specified as "clean, no platform-specific syntax" but the canonical markup format is undefined. If the adapter returns CommonMark, the connector must translate it to the platform's syntax (Telegram MarkdownV2, Discord Markdown, Slack mrkdwn). If translation is the adapter's responsibility, cross-platform adapters must know all platform syntaxes.
 
 **Work needed**:
 - Declare a canonical markup format for `AgentResponse.text` (recommendation: CommonMark).
@@ -1030,35 +1030,35 @@ The following design questions are deferred until the v0 codebase is built and u
 - Update `send()` in the connector interface spec to include a `renderMarkdown(text: string) → string` step before delivery.
 - Document platform-specific limitations (e.g., Telegram MarkdownV2 does not support tables).
 
-**Blocking**: Not blocking for plain-text responses. Becomes necessary before rich formatting is used in production harnesses.
+**Blocking**: Not blocking for plain-text responses. Becomes necessary before rich formatting is used in production adapters.
 
 ---
 
 ### TODO-9: `progressCallback` Error Contract
 
-**Issue**: `progressCallback` is a fire-and-forget call from the harness to the gateway for live progress display during tool execution. The error handling contract is unspecified: if the gateway fails to deliver the progress update (rate limit, network error), it is unclear whether the callback throws into the harness tool loop.
+**Issue**: `progressCallback` is a fire-and-forget call from the adapter to the gateway for live progress display during tool execution. The error handling contract is unspecified: if the gateway fails to deliver the progress update (rate limit, network error), it is unclear whether the callback throws into the adapter tool loop.
 
 **Work needed**:
 - Specify that `progressCallback` must never throw — the gateway absorbs all delivery errors silently.
-- Document this contract in the `AgentRequest` type definition and in the harness implementation guide.
+- Document this contract in the `AgentRequest` type definition and in the adapter implementation guide.
 - Consider whether `progressCallback` should return a `Promise<void>` (awaitable) or be synchronous fire-and-forget. Awaitable is safer; synchronous is simpler.
 
-**Blocking**: Not blocking. Becomes a correctness issue once harnesses use `progressCallback` in tool loops without defensive wrapping.
+**Blocking**: Not blocking. Becomes a correctness issue once adapters use `progressCallback` in tool loops without defensive wrapping.
 
 ---
 
 ### TODO-10: SDK Versioning Strategy for `AgentRequest` / `AgentResponse`
 
-**Issue**: The roadmap includes extracting `AgentHarness` + built-in implementations into an `agent-gateway-sdk` package. `AgentRequest` and `AgentResponse` are currently defined in the gateway spec without a versioning strategy. Breaking changes to these types would silently break all external harness implementations.
+**Issue**: The roadmap includes extracting `AgentAdapter` + built-in implementations into an `agent-gateway-sdk` package. `AgentRequest` and `AgentResponse` are currently defined in the gateway spec without a versioning strategy. Breaking changes to these types would silently break all external adapter implementations.
 
 **Work needed**:
 - Define a versioning strategy before the SDK is published. Options:
   - (a) Semantic versioning on the SDK package with a changelog for breaking changes to `AgentRequest`/`AgentResponse`.
-  - (b) A `version` field in `AgentRequest` so harnesses can assert compatibility at runtime.
+  - (b) A `version` field in `AgentRequest` so adapters can assert compatibility at runtime.
 - Establish a deprecation policy: fields may be added (non-breaking); fields may not be removed or renamed without a major version bump.
 - Create a `CHANGELOG.md` for the SDK from day one.
 
-**Blocking**: Not blocking until the SDK is published. Must be resolved before any external harness author takes a dependency on the package.
+**Blocking**: Not blocking until the SDK is published. Must be resolved before any external adapter author takes a dependency on the package.
 
 ---
 
@@ -1070,7 +1070,7 @@ The gateway runtime is implemented in **TypeScript on Node.js 22 LTS**.
 
 #### Rationale
 
-All target harness frameworks (LangGraph, CrewAI, AutoGen/Microsoft Agent Framework, OpenAI Agents SDK) are Python-first. This means the harness will almost always run as a separate process connected to the gateway via `HTTPHarness`. The gateway language is therefore invisible to harness authors — the HTTP boundary makes it irrelevant.
+All target adapter frameworks (LangGraph, CrewAI, AutoGen/Microsoft Agent Framework, OpenAI Agents SDK) are Python-first. This means the adapter will almost always run as a separate process connected to the gateway via `HttpAdapter`. The gateway language is therefore invisible to adapter authors — the HTTP boundary makes it irrelevant.
 
 Given that, the gateway language choice is driven entirely by which language best serves the gateway's own responsibilities: platform connectivity, event-loop efficiency, and type-safe contract enforcement at layer boundaries.
 
@@ -1128,25 +1128,25 @@ The table below covers all planned connectors across v0 and v1. v0 builds Telegr
 
 ---
 
-### 14.4 Layer 3 — Built-in Harness Implementations
+### 14.4 Layer 3 — Built-in adapter implementations
 
-| Harness | Implementation |
+| adapter | Implementation |
 |---|---|
-| **`HTTPHarness`** | Pure Node.js built-in `fetch` + `AbortController`. No third-party HTTP client library. |
-| **`EmbeddedHarness`** | Wraps any in-process TypeScript/JavaScript agent. Python harnesses are not embedded — they run as separate processes connected via `HTTPHarness`. |
+| **`HttpAdapter`** | Pure Node.js built-in `fetch` + `AbortController`. No third-party HTTP client library. |
+| **`EmbeddedAdapter`** | Wraps any in-process TypeScript/JavaScript agent. Python agents are not embedded — they run as separate processes connected via `HttpAdapter`. |
 
 ---
 
 ### 14.5 SDK Packages
 
-The `agent-gateway-sdk` is published in two languages. Both expose the same logical surface: the `AgentHarness` contract, `AgentRequest`/`AgentResponse` types, and the `HTTPHarness` built-in implementation.
+The `agent-gateway-sdk` is published in two languages. Both expose the same logical surface: the `AgentAdapter` contract, `AgentRequest`/`AgentResponse` types, and the `HttpAdapter` built-in implementation.
 
 | Package | Language | Registry | Contents |
 |---|---|---|---|
-| `@agent-gateway/sdk` | TypeScript | npm | `AgentHarness` interface, `AgentRequest`/`AgentResponse` types, `HTTPHarness`, `EmbeddedHarness` — compiled directly from the gateway's own type definitions |
-| `agent-gateway-sdk` | Python | PyPI | `AgentHarness` abstract base class, `AgentRequest`/`AgentResponse` as Pydantic `BaseModel`, `HttpHarness` using `httpx` |
+| `@agent-gateway/sdk` | TypeScript | npm | `AgentAdapter` interface, `AgentRequest`/`AgentResponse` types, `HttpAdapter`, `EmbeddedAdapter` — compiled directly from the gateway's own type definitions |
+| `agent-gateway-sdk` | Python | PyPI | `AgentAdapter` abstract base class, `AgentRequest`/`AgentResponse` as Pydantic `BaseModel`, `HttpAdapter` using `httpx` |
 
-The Python SDK is the primary integration surface for harness authors. It is intentionally minimal: types and `HttpHarness` only. It does not re-implement the gateway.
+The Python SDK is the primary integration surface for adapter authors. It is intentionally minimal: types and `HttpAdapter` only. It does not re-implement the gateway.
 
 **Sync strategy (v0)**: The Python SDK types are manually kept in sync with the TypeScript definitions. A code-generation step (e.g., `quicktype` from a shared JSON Schema) is deferred post-v0 and tracked in TODO-10.
 
@@ -1171,21 +1171,21 @@ agent-gateway/
 │   │   │   │   ├── session/
 │   │   │   │   ├── commands/
 │   │   │   │   └── reliability/
-│   │   │   └── harness/
+│   │   │   └── adapter/
 │   │   │       ├── http.ts
 │   │   │       └── embedded.ts
 │   │   └── package.json
 │   ├── sdk-ts/                    # npm: @agent-gateway/sdk
 │   │   └── src/
-│   │       ├── types.ts           # AgentRequest, AgentResponse, AgentHarness
-│   │       └── harness/
+│   │       ├── types.ts           # AgentRequest, AgentResponse, AgentAdapter
+│   │       └── adapter/
 │   │           ├── http.ts
 │   │           └── embedded.ts
 │   ├── sdk-py/                    # PyPI: agent-gateway-sdk
 │   │   └── agent_gateway/
 │   │       ├── types.py           # Pydantic models — kept in sync with sdk-ts/src/types.ts
-│   │       └── harness.py         # HttpHarness using httpx
-│   └── agent-reference/           # Reference LangGraph agent (Python) — v0 harness example
+│   │       └── adapter.py         # HttpAdapter using httpx
+│   └── agent-reference/           # Reference LangGraph agent (Python) — v0 adapter example
 │       └── agent_reference/
 │           ├── agent.py
 │           ├── tools.py
@@ -1225,7 +1225,7 @@ agent-gateway/
 │   ├── gateway/                        # Runnable gateway process
 │   ├── sdk-ts/                         # npm: @agent-gateway/sdk
 │   ├── sdk-py/                         # PyPI: agent-gateway-sdk
-│   └── agent-reference/                # Reference LangGraph agent (Python) — v0 harness example
+│   └── agent-reference/                # Reference LangGraph agent (Python) — v0 adapter example
 ├── docs/
 │   ├── agent-gateway-design.md
 │   └── v0-planning.md
@@ -1241,7 +1241,7 @@ agent-gateway/
 ```
 packages/gateway/
 ├── src/
-│   ├── index.ts                        # Entry point: load config, wire connectors + harness, call gateway.start()
+│   ├── index.ts                        # Entry point: load config, wire connectors + adapter, call gateway.start()
 │   │
 │   ├── connectors/                     # Layer 1 — one directory per platform
 │   │   ├── types.ts                    # ConnectorInterface, NormalizedMessage, MediaItem, Mention, DeliveryTarget, DeliveryResult
@@ -1272,11 +1272,11 @@ packages/gateway/
 │   │
 │   ├── core/                           # Layer 2 — platform-agnostic gateway logic
 │   │   ├── pipeline/
-│   │   │   ├── index.ts                # runTurn(msg, connector, harness) — the 6-stage pipeline
+│   │   │   ├── index.ts                # runTurn(msg, connector, adapter) — the 6-stage pipeline
 │   │   │   ├── classify.ts             # Stage 2: NormalizedMessage → TurnClass
 │   │   │   ├── identify.ts             # Stage 3: sessionKey + SessionRecord resolution
 │   │   │   ├── concurrency.ts          # Stage 4: RunSlot acquire / queue / abort
-│   │   │   ├── dispatch.ts             # Stage 5: AgentRequest build + harness.run() + send
+│   │   │   ├── dispatch.ts             # Stage 5: AgentRequest build + adapter.run() + send
 │   │   │   ├── finalize.ts             # Stage 6: slot release, audit log, pending drain
 │   │   │   └── pipeline.test.ts        # Unit tests using MockConnector + MockHarness
 │   │   ├── session/
@@ -1293,11 +1293,11 @@ packages/gateway/
 │   │   ├── audit.ts                    # AuditLog (append-only, better-sqlite3)
 │   │   └── gateway.ts                  # GatewayRunner: start(), stop(), ConnectorManager, reconnect loop
 │   │
-│   ├── harness/                        # Layer 3 — built-in AgentHarness implementations
-│   │   ├── types.ts                    # AgentHarness interface, AgentRequest, AgentResponse (source of truth)
-│   │   ├── http.ts                     # HTTPHarness
-│   │   ├── embedded.ts                 # EmbeddedHarness
-│   │   └── harness.test.ts
+│   ├── adapter/                        # Layer 3 — built-in AgentAdapter implementations
+│   │   ├── types.ts                    # AgentAdapter interface, AgentRequest, AgentResponse (source of truth)
+│   │   ├── http.ts                     # HttpAdapter
+│   │   ├── embedded.ts                 # EmbeddedAdapter
+│   │   └── adapter.test.ts
 │   │
 │   ├── config/
 │   │   ├── schema.ts                   # Zod schema for gateway.config.yaml (see Section 16)
@@ -1321,10 +1321,10 @@ packages/gateway/
 
 | Rule | Rationale |
 |---|---|
-| `connectors/*` must not import from `core/*` or `harness/*` | Connectors are platform adapters; they must not depend on gateway internals |
+| `connectors/*` must not import from `core/*` or `adapter/*` | Connectors are platform adapters; they must not depend on gateway internals |
 | `core/*` must not import from `connectors/*` | The core pipeline is platform-agnostic; platform types must not leak in |
-| `core/*` must not import from `harness/*` except via the `AgentHarness` interface | The core calls `harness.run()` against the interface only |
-| `harness/types.ts` is the **source of truth** for `AgentRequest`/`AgentResponse` | `sdk-ts` re-exports from this file; `sdk-py` is synced against it |
+| `core/*` must not import from `adapter/*` except via the `AgentAdapter` interface | The core calls `adapter.run()` against the interface only |
+| `adapter/types.ts` is the **source of truth** for `AgentRequest`/`AgentResponse` | `sdk-ts` re-exports from this file; `sdk-py` is synced against it |
 | `connectors/types.ts` is the **source of truth** for `NormalizedMessage` | No platform-specific fields may appear here |
 | CJS imports (`@microsoft/botbuilder`) are confined to `connectors/teams/index.ts` | Prevents CJS from propagating into ESM modules |
 
@@ -1336,15 +1336,15 @@ packages/gateway/
 packages/sdk-ts/
 ├── src/
 │   ├── index.ts                        # Public API re-exports
-│   ├── types.ts                        # Re-exports AgentHarness, AgentRequest, AgentResponse from gateway/harness/types.ts
-│   └── harness/
-│       ├── http.ts                     # HTTPHarness (copy, not symlink — sdk is standalone)
-│       └── embedded.ts                 # EmbeddedHarness
+│   ├── types.ts                        # Re-exports AgentAdapter, AgentRequest, AgentResponse from gateway/adapter/types.ts
+│   └── adapter/
+│       ├── http.ts                     # HttpAdapter (copy, not symlink — sdk is standalone)
+│       └── embedded.ts                 # EmbeddedAdapter
 ├── package.json                        # name: "@agent-gateway/sdk"
 └── tsconfig.json
 ```
 
-The SDK does **not** import from `packages/gateway` at runtime. Types are duplicated (not symlinked) so the SDK can be published and consumed independently. A CI check enforces that `sdk-ts/src/types.ts` is byte-identical to `gateway/src/harness/types.ts`.
+The SDK does **not** import from `packages/gateway` at runtime. Types are duplicated (not symlinked) so the SDK can be published and consumed independently. A CI check enforces that `sdk-ts/src/types.ts` is byte-identical to `gateway/src/adapter/types.ts`.
 
 ---
 
@@ -1354,8 +1354,8 @@ The SDK does **not** import from `packages/gateway` at runtime. Types are duplic
 packages/sdk-py/
 ├── agent_gateway/
 │   ├── __init__.py                     # Public API exports
-│   ├── types.py                        # AgentRequest, AgentResponse as Pydantic BaseModel; AgentHarness as ABC
-│   └── harness.py                      # HttpHarness using httpx (async)
+│   ├── types.py                        # AgentRequest, AgentResponse as Pydantic BaseModel; AgentAdapter as ABC
+│   └── adapter.py                      # HttpAdapter using httpx (async)
 ├── tests/
 │   └── test_types.py                   # Validate Pydantic models round-trip with sample AgentRequest JSON
 ├── pyproject.toml                      # name: "agent-gateway-sdk"; dependencies: pydantic>=2, httpx
@@ -1427,9 +1427,9 @@ gateway:
   # Default: 300000 (5 minutes)
   approvalTimeoutMs: 300000
 
-  # Maximum time (ms) to wait for harness.run() to return before throwing HarnessTimeoutError.
+  # Maximum time (ms) to wait for adapter.run() to return before throwing AdapterTimeoutError.
   # Default: 300000 (5 minutes)
-  harnessTimeoutMs: 300000
+  adapterTimeoutMs: 300000
 
   # Log level: "fatal" | "error" | "warn" | "info" | "debug" | "trace"
   # Default: "info"
@@ -1479,17 +1479,17 @@ http:
   # tlsCert: /etc/certs/tls.crt
   # tlsKey: /etc/certs/tls.key
 
-# ─── Harness ─────────────────────────────────────────────────────────────────
-# Exactly one harness is active per gateway instance.
+# ─── adapter ─────────────────────────────────────────────────────────────────
+# Exactly one adapter is active per gateway instance.
 
-harness:
+adapter:
   type: http                            # "http" | "embedded"
   url: http://localhost:8080/run        # Required for type: http
-  # Optional bearer token for harness endpoint authentication:
+  # Optional bearer token for adapter endpoint authentication:
   # bearerTokenEnv: HARNESS_BEARER_TOKEN   # Name of the env var holding the token
 
   # type: embedded
-  # module: ./my-agent/index.ts        # Path to a TS/JS module exporting a default AgentHarness
+  # module: ./my-agent/index.ts        # Path to a TS/JS module exporting a default AgentAdapter
 ```
 
 ---
@@ -1517,12 +1517,12 @@ Enforced by the Zod schema in `config/schema.ts` at startup. Violations are hard
 |---|---|
 | Each `connectors[].accountId` must be unique across all connectors | Duplicate `accountId` would corrupt session keys |
 | `connectors[].type` must match a registered connector implementation | Unknown connector type — check spelling or confirm connector is built |
-| `harness.type = "http"` requires `harness.url` | Missing harness URL |
-| `harness.type = "embedded"` requires `harness.module` | Missing module path |
+| `adapter.type = "http"` requires `adapter.url` | Missing adapter URL |
+| `adapter.type = "embedded"` requires `adapter.module` | Missing module path |
 | `http.port` must be 1–65535 | Invalid port |
 | Any `${ENV_VAR_NAME}` reference with no matching env var | Secret not found in environment |
 | `gateway.pendingQueueCap` must be ≥ 1 | Invalid queue cap |
-| `gateway.harnessTimeoutMs` must be ≥ 1000 | Timeout too low to be meaningful |
+| `gateway.adapterTimeoutMs` must be ≥ 1000 | Timeout too low to be meaningful |
 
 ---
 
@@ -1533,7 +1533,7 @@ Enforced by the Zod schema in `config/schema.ts` at startup. Violations are hard
 1. **Fail fast at startup, never at runtime for config errors.** Invalid configuration is a hard crash before any connector starts. A misconfigured gateway that starts and silently drops messages is worse than one that refuses to start.
 2. **Isolate connector failures from the turn pipeline.** A connector that crashes or disconnects must not affect other connectors or ongoing sessions on other connectors.
 3. **Users must never be silently abandoned mid-turn.** If Stage 5 (DISPATCH) throws, the user receives an error acknowledgement. Silent failures are not acceptable.
-4. **The harness is untrusted.** The gateway treats the harness as an external process. Exceptions thrown from `harness.run()`, malformed `AgentResponse`, and timeouts are all handled defensively.
+4. **The adapter is untrusted.** The gateway treats the adapter as an external process. Exceptions thrown from `adapter.run()`, malformed `AgentResponse`, and timeouts are all handled defensively.
 5. **Errors are structured and logged at the boundary where they are caught.** An error is logged once, at the boundary where it is first caught. It is not re-logged as it propagates.
 
 ---
@@ -1564,8 +1564,8 @@ export class ConnectorSendError extends GatewayError {}      // Error in connect
 
 // ── Pipeline errors ────────────────────────────────────────────────────────
 
-export class HarnessError extends GatewayError {}            // harness.run() threw or returned malformed response
-export class HarnessTimeoutError extends HarnessError {}     // harness.run() did not return within deadline
+export class AdapterError extends GatewayError {}            // adapter.run() threw or returned malformed response
+export class AdapterTimeoutError extends AdapterError {}     // adapter.run() did not return within deadline
 export class ApprovalTimeoutError extends GatewayError {}    // Approval not received within approvalTimeoutMs
 
 // ── Session errors ─────────────────────────────────────────────────────────
@@ -1608,10 +1608,10 @@ This is the most critical error boundary. A user has sent a message and is waiti
 
 | Condition | User sees | Logged as | Turn outcome |
 |---|---|---|---|
-| `harness.run()` throws `HarnessError` | `"Something went wrong processing your message. Please try again."` | `error` with stack trace and `sessionKey` | `error` |
-| `harness.run()` throws `HarnessTimeoutError` | `"The agent took too long to respond. Please try again."` | `error` with `durationMs` | `error` |
-| `harness.run()` returns malformed `AgentResponse` (fails Zod parse) | `"The agent returned an invalid response."` | `error` with raw response (truncated) | `error` |
-| `abortSignal` fires and harness returns `interrupted: true` | No message sent (user interrupted the turn themselves) | `dispatched` with `interrupted: true` | `dispatched` |
+| `adapter.run()` throws `AdapterError` | `"Something went wrong processing your message. Please try again."` | `error` with stack trace and `sessionKey` | `error` |
+| `adapter.run()` throws `AdapterTimeoutError` | `"The agent took too long to respond. Please try again."` | `error` with `durationMs` | `error` |
+| `adapter.run()` returns malformed `AgentResponse` (fails Zod parse) | `"The agent returned an invalid response."` | `error` with raw response (truncated) | `error` |
+| `abortSignal` fires and adapter returns `interrupted: true` | No message sent (user interrupted the turn themselves) | `dispatched` with `interrupted: true` | `dispatched` |
 | `connector.send()` fails after all retries (`ConnectorSendError`) | Plain-text fallback attempted; if that also fails, logged only — user may not see any response | `error` | `error` |
 | `ApprovalTimeoutError` | `"Approval request expired — action was not taken."` | `handled` | `handled` |
 

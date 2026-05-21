@@ -3,9 +3,11 @@
 import Database from 'better-sqlite3'
 import { resolve } from 'node:path'
 import { mkdirSync } from 'node:fs'
+import { serve } from '@hono/node-server'
+import { Hono } from 'hono'
 
 import type { ConnectorInterface } from '../connectors/types.js'
-import type { AgentHarness } from '../harness/types.js'
+import type { AgentAdapter } from '../adapter/types.js'
 import type { GatewayConfig } from '../config/schema.js'
 import { SessionRegistry } from './session/registry.js'
 import { SessionRunRegistry } from './session/run-slot.js'
@@ -16,26 +18,38 @@ import { logger, setLogLevel } from '../lib/logger.js'
 const RECONNECT_BASE_MS = 1_000
 const RECONNECT_MAX_MS = 60_000
 
+/** Connectors that expose a Hono sub-app for webhook/HTTP handling. */
+interface WebhookConnector extends ConnectorInterface {
+  readonly app: Hono
+  /** Mount path prefix, e.g. '/v1' or '/webhooks/wechat-oa' */
+  readonly webhookMountPath?: string
+}
+
+function isWebhookConnector(c: ConnectorInterface): c is WebhookConnector {
+  return 'app' in c && (c as WebhookConnector).app instanceof Hono
+}
+
 export interface GatewayRunnerOptions {
   config: GatewayConfig
   connectors: ConnectorInterface[]
-  harness: AgentHarness
+  adapter: AgentAdapter
 }
 
 export class GatewayRunner {
   private config: GatewayConfig
   private connectors: ConnectorInterface[]
-  private harness: AgentHarness
+  private adapter: AgentAdapter
   private sessionRegistry!: SessionRegistry
   private runRegistry: SessionRunRegistry
   private auditLog!: AuditLog
   private approvalMap = new Map<string, (result: 'approved' | 'denied') => void>()
   private stopped = false
+  private httpServer: ReturnType<typeof serve> | null = null
 
   constructor(opts: GatewayRunnerOptions) {
     this.config = opts.config
     this.connectors = opts.connectors
-    this.harness = opts.harness
+    this.adapter = opts.adapter
     this.runRegistry = new SessionRunRegistry()
   }
 
@@ -57,6 +71,9 @@ export class GatewayRunner {
 
     logger.info({ dataDir, dbPath }, 'GatewayRunner: starting')
 
+    // Build the shared Hono HTTP server and mount webhook connector sub-apps.
+    this.startHttpServer()
+
     // Start connectors with reconnect loop.
     for (const connector of this.connectors) {
       this.wireConnector(connector)
@@ -70,12 +87,48 @@ export class GatewayRunner {
     logger.info('GatewayRunner: all connectors started')
   }
 
+  private startHttpServer(): void {
+    const root = new Hono()
+    const port = process.env['PORT'] != null
+      ? parseInt(process.env['PORT'], 10)
+      : this.config.http.port
+
+    // Mount each webhook-capable connector onto its path.
+    for (const connector of this.connectors) {
+      if (!isWebhookConnector(connector)) continue
+
+      // Determine mount path:
+      //   - WechatOaConnector: config.webhookPath (default /webhooks/wechat-oa)
+      //   - OpenAIApiConnector: config.listenPath (default /v1)
+      // Both are stored in the connector config; we access via the config store
+      // on the connector itself. Use a duck-type check for the path property.
+      const mountPath =
+        (connector as unknown as { config?: { webhookPath?: string; listenPath?: string } })
+          .config?.webhookPath ??
+        (connector as unknown as { config?: { webhookPath?: string; listenPath?: string } })
+          .config?.listenPath ??
+        `/${connector.type}`
+
+      root.route(mountPath, connector.app)
+      logger.info(
+        { accountId: connector.accountId, mountPath },
+        'GatewayRunner: mounted webhook connector',
+      )
+    }
+
+    root.get('/health', (c) => c.json({ status: 'ok' }))
+
+    this.httpServer = serve({ fetch: root.fetch, port }, (info) => {
+      logger.info({ port: info.port }, 'GatewayRunner: HTTP server listening')
+    })
+  }
+
   private wireConnector(connector: ConnectorInterface): void {
     connector.onMessage((msg) => {
       if (this.stopped) return
       runTurn(msg, {
         connector,
-        harness: this.harness,
+        adapter: this.adapter,
         sessionRegistry: this.sessionRegistry,
         runRegistry: this.runRegistry,
         auditLog: this.auditLog,
@@ -123,6 +176,8 @@ export class GatewayRunner {
     if (this.stopped) return
     this.stopped = true
     logger.info({ shutdownTimeoutMs: this.config.gateway.shutdownTimeoutMs }, 'GatewayRunner: shutting down')
+
+    this.httpServer?.close()
 
     // Stop accepting new messages — connectors will stop their polling loops.
     await Promise.allSettled(

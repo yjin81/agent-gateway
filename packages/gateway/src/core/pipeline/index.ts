@@ -2,7 +2,7 @@
 
 import type { NormalizedMessage } from '../../connectors/types.js'
 import type { ConnectorInterface } from '../../connectors/types.js'
-import type { AgentHarness } from '../../harness/types.js'
+import type { AgentAdapter } from '../../adapter/types.js'
 import type { SessionRegistry } from '../session/registry.js'
 import type { SessionRunRegistry } from '../session/run-slot.js'
 import type { AuditLog, TurnOutcome } from '../audit.js'
@@ -12,8 +12,8 @@ import { classify } from './classify.js'
 import { keepTyping } from '../typing.js'
 import { sendWithRetry } from '../reliability.js'
 import {
-  HarnessError,
-  HarnessTimeoutError,
+  AdapterError,
+  AdapterTimeoutError,
   ConnectorSendError,
   ApprovalTimeoutError,
 } from '../../lib/errors.js'
@@ -22,7 +22,7 @@ import { handleCommand } from '../commands/handlers.js'
 
 export interface RunTurnDeps {
   connector: ConnectorInterface
-  harness: AgentHarness
+  adapter: AgentAdapter
   sessionRegistry: SessionRegistry
   runRegistry: SessionRunRegistry
   auditLog: AuditLog
@@ -39,13 +39,16 @@ export async function runTurn(
   deps: RunTurnDeps,
 ): Promise<TurnOutcome> {
   const startTime = Date.now()
-  const { connector, harness, sessionRegistry, runRegistry, auditLog, config } = deps
+  const { connector, adapter, sessionRegistry, runRegistry, auditLog, config } = deps
 
   // ── Stage 2: CLASSIFY ─────────────────────────────────────────────────────
   const classified = classify(msg)
+  logger.debug(
+    { accountId: connector.accountId, messageId: msg.id, senderId: msg.sender.id, classified },
+    'Stage 2 CLASSIFY',
+  )
   if (classified.drop) {
     if (classified.reason === 'not-addressed') {
-      // Observed — log but don't audit (not agent-addressed).
       return 'observed'
     }
     return 'dropped'
@@ -139,7 +142,7 @@ export async function runTurn(
     // 5a. keep_typing started above.
 
     // 5b. Build AgentRequest.
-    const request: import('../../harness/types.js').AgentRequest = {
+    const request: import('../../adapter/types.js').AgentRequest = {
       sessionKey,
       message: msg.text,
       messageRaw: msg.textRaw,
@@ -188,22 +191,26 @@ export async function runTurn(
       },
     }
 
-    // 5c. Call harness with timeout.
-    let response: import('../../harness/types.js').AgentResponse
+    // 5c. Call adapter with timeout.
+    logger.debug(
+      { sessionKey, platform: connector.type, chatKind: msg.chat.kind, userId: msg.sender.id, message: msg.text, isNew: sessionRecord.isNew, mediaCount: msg.media.length },
+      'Stage 5 DISPATCH → adapter.run()',
+    )
+    let response: import('../../adapter/types.js').AgentResponse
     try {
       response = await withTimeout(
-        harness.run(request),
-        config.gateway.harnessTimeoutMs,
+        adapter.run(request),
+        config.gateway.adapterTimeoutMs,
         () => abortCtrl.abort(),
       )
     } catch (err) {
-      if (err instanceof HarnessTimeoutError) {
+      if (err instanceof AdapterTimeoutError) {
         await safeSend(connector, msg.chat.id, 'The agent took too long to respond. Please try again.')
-        logger.error({ sessionKey, platform: connector.type, accountId: connector.accountId, durationMs: Date.now() - startTime, err }, 'Stage 5: harness timeout')
+        logger.error({ sessionKey, platform: connector.type, accountId: connector.accountId, durationMs: Date.now() - startTime, err }, 'Stage 5: adapter timeout')
         outcome = 'error'
       } else {
         await safeSend(connector, msg.chat.id, 'Something went wrong processing your message. Please try again.')
-        logger.error({ sessionKey, platform: connector.type, accountId: connector.accountId, err }, 'Stage 5: harness error')
+        logger.error({ sessionKey, platform: connector.type, accountId: connector.accountId, err }, 'Stage 5: adapter error')
         outcome = 'error'
       }
       return outcome
@@ -217,7 +224,12 @@ export async function runTurn(
       return outcome
     }
 
-    // Interrupted turn — harness cut short by abortSignal.
+    logger.debug(
+      { sessionKey, text: response.text, mediaCount: response.media.length, interrupted: response.interrupted, durationMs: Date.now() - startTime },
+      'Stage 5 DISPATCH ← adapter response',
+    )
+
+    // Interrupted turn — adapter cut short by abortSignal.
     if (response.interrupted) {
       outcome = 'dispatched'
       return outcome
@@ -225,6 +237,10 @@ export async function runTurn(
 
     // 5e. Send response text.
     if (response.text.trim()) {
+      logger.debug(
+        { sessionKey, chatId: msg.chat.id, textLength: response.text.length },
+        'Stage 5 FINALIZE → delivering response to connector',
+      )
       try {
         await sendWithRetry(connector, { chatId: msg.chat.id }, response.text)
       } catch (err) {
@@ -281,7 +297,7 @@ async function withTimeout<T>(
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       onTimeout()
-      reject(new HarnessTimeoutError(`Harness did not respond within ${timeoutMs}ms`))
+      reject(new AdapterTimeoutError(`Adapter did not respond within ${timeoutMs}ms`))
     }, timeoutMs)
   })
   try {

@@ -1,4 +1,4 @@
-"""harness.py — AgentHarness ABC and HttpHarness using httpx."""
+"""adapter.py — AgentAdapter ABC and HttpAdapter using httpx."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import httpx
 from .types import AgentRequest, AgentResponse
 
 
-class AgentHarness(abc.ABC):
-    """Abstract base class for all Agent Gateway harness implementations."""
+class AgentAdapter(abc.ABC):
+    """Abstract base class for all Agent Gateway adapter implementations."""
 
     @abc.abstractmethod
     async def run(self, request: AgentRequest) -> AgentResponse:
@@ -23,10 +23,10 @@ class AgentHarness(abc.ABC):
         pass
 
 
-class HttpHarness(AgentHarness):
+class HttpAdapter(AgentAdapter):
     """
     Forwards AgentRequest to an HTTP endpoint and returns AgentResponse.
-    Suitable for wrapping any FastAPI / Flask / ASGI harness server.
+    Suitable for wrapping any FastAPI / Flask / ASGI agent server.
     """
 
     def __init__(
