@@ -19,8 +19,11 @@ const TelegramConnectorSchema = BaseConnectorSchema.extend({
 
 const SlackConnectorSchema = BaseConnectorSchema.extend({
   type: z.literal('slack'),
+  /** Bot token (xoxb-...) — requires chat:write, im:history, channels:history, groups:history scopes. */
   botToken: z.string().min(1),
+  /** App-level token (xapp-...) — requires connections:write scope. Used for Socket Mode. */
   appToken: z.string().min(1),
+  /** Signing secret from the app's Basic Information page. Used to verify webhook payloads (webhook mode only). */
   signingSecret: z.string().min(1),
 })
 
@@ -121,7 +124,7 @@ export const GatewayConfigSchema = z
   .object({
     gateway: z
       .object({
-        dataDir: z.string().default('./data'),
+        dataDir: z.string().default('.'),
         shutdownTimeoutMs: z.number().int().positive().default(60_000),
         idleTimeoutMs: z.number().int().positive().default(3_600_000),
         pendingQueueCap: z.number().int().min(1).default(1),

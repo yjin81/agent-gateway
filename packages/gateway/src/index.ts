@@ -5,6 +5,7 @@ import { GatewayRunner } from './core/gateway.js'
 import { TelegramConnector } from './connectors/telegram/index.js'
 import { OpenAIApiConnector } from './connectors/openai-api/index.js'
 import { WechatConnector } from './connectors/wechat/index.js'
+import { SlackConnector } from './connectors/slack/index.js'
 import { HttpAdapter } from './adapter/http.js'
 import { EmbeddedAdapter } from './adapter/embedded.js'
 import type { AgentAdapter } from './adapter/types.js'
@@ -42,8 +43,8 @@ async function main(): Promise<void> {
       case 'wechat':
         connectors.push(new WechatConnector(connectorConfig, dataDir))
         break
-      case 'slack':
-        logger.warn({ accountId: connectorConfig['accountId'] }, 'Slack connector is v1 — not yet implemented')
+    case 'slack':
+        connectors.push(new SlackConnector(connectorConfig))
         break
       case 'teams':
         logger.warn({ accountId: connectorConfig['accountId'] }, 'Teams connector is v1 — not yet implemented')

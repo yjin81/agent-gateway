@@ -109,26 +109,33 @@ Platform context and session metadata are injected as a system message so the Fo
 
 ---
 
-## Bearer token refresh
+## Bearer token management
 
-`bearerTokenEnv` is read from `process.env` at request time, not at startup. To rotate a short-lived token (e.g. an Azure AD JWT):
+Short-lived tokens like Azure AD JWTs must **not** be stored in `data/.env`. They expire (typically within 1 hour) and stale values in `.env` cause hard-to-diagnose 401s — the config interpolation `${AGENT_TOKEN}` would bake the expired value into the config at startup.
 
-1. Update the env var in the shell or process environment.
-2. The next request automatically picks up the new value — no restart needed.
+The correct split:
 
-**Azure Foundry token refresh** (PowerShell):
+| Where | What goes there |
+|---|---|
+| `data/.env` | Long-lived secrets: `WECHAT_TOKEN`, bot tokens, API keys, `AGENT_ENDPOINT` |
+| `start-gateway.ps1` | Short-lived tokens fetched fresh on every startup |
 
-```powershell
-$env:AGENT_TOKEN = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
+`start-gateway.ps1` fetches `AGENT_TOKEN` via `az account get-access-token` before starting the gateway and fails fast if the fetch fails — so the gateway never starts with a missing or expired token.
+
+`bearerTokenEnv` is read from `process.env` at request time (not at startup), so the token value seen by the gateway is whatever was set in the process environment when `start-gateway.ps1` launched it.
+
+**`bearerTokenEnv` must be set to the name of the env var, not its value:**
+
+```yaml
+# Correct — the gateway looks up process.env['AGENT_TOKEN'] at request time
+bearerTokenEnv: AGENT_TOKEN
+
+# Wrong — config interpolation bakes the JWT string into bearerTokenEnv,
+# then process.env['eyJ0eX...'] returns undefined → empty bearer → 401
+bearerTokenEnv: ${AGENT_TOKEN}
 ```
 
-**Azure Foundry token refresh** (bash):
-
-```sh
-export AGENT_TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
-```
-
-The token must be in scope for `https://ai.azure.com`. Run `az login` first if needed.
+To manually refresh mid-session, restart the gateway via `.\start-gateway.ps1` — it always fetches a fresh token. The token expiry time is printed at startup so you know when the next restart is needed.
 
 ---
 

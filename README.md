@@ -152,15 +152,19 @@ WECHAT_TOKEN=your-ilink-bot-token
 WECHAT_ILINK_BOT_ID=your-ilink-bot-id@im.bot
 WECHAT_BASE_URL=https://ilinkai.weixin.qq.com
 
-# Azure Foundry / Azure OpenAI (short-lived JWT — refresh before starting)
-AGENT_TOKEN=eyJ...
-
-# HTTP adapter endpoint (Foundry Responses endpoint or your agent server)
-ADAPTER_URL=https://<your-foundry-endpoint>/protocols/openai/responses?api-version=2025-11-15-preview
+# Azure Foundry / Azure OpenAI — endpoint URL (token is fetched at startup, not stored here)
+AGENT_ENDPOINT=https://<resource>.services.ai.azure.com/api/projects/<project>/applications/<app>/protocols/openai/responses?api-version=2025-11-15-preview
 
 # Telegram
 TELEGRAM_BOT_TOKEN=your-telegram-bot-token
+
+# Slack (see docs/connectors/slack.md)
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_SIGNING_SECRET=...
 ```
+
+**Do not put `AGENT_TOKEN` in `.env`.** It is a short-lived Azure AD JWT fetched automatically by `start-gateway.ps1` on every startup. Storing it here causes 401s when it expires between restarts.
 
 ### 5. Connector-specific setup
 
@@ -185,40 +189,46 @@ python -m agent_reference.server
 
 ### 7. Start the gateway
 
+A startup script handles env loading and token refresh automatically:
+
+```powershell
+.\start-gateway.ps1
+```
+
+What it does:
+1. Loads `data/.env` into the process environment
+2. Fetches a fresh `AGENT_TOKEN` from Azure AD (`az account get-access-token`) — skips gracefully if `az` is unavailable
+3. Sets `GATEWAY_DATA_DIR` to the absolute path of `data/`
+4. Starts `pnpm exec tsx src/index.ts` from `packages/gateway`
+
+**Requirements**: `az` CLI installed and signed in (`az login`). Only needed for Azure Foundry/Azure OpenAI adapters.
+
+#### Manual startup (if you prefer)
+
 The gateway does **not** auto-load `.env`. You must load it into the shell first, then set `GATEWAY_DATA_DIR` so the gateway can locate the config file regardless of working directory.
 
 **PowerShell:**
 
 ```powershell
-# Load secrets from data/.env into the current shell
-Get-Content data\.env | Where-Object { $_ -match '^[A-Z]' } | ForEach-Object {
-    $parts = $_ -split '=', 2
-    Set-Item "env:$($parts[0])" $parts[1]
+# Run all of this in one shell session from the repo root
+Get-Content data\.env | Where-Object { $_ -match '^[A-Z_]+=.' } | ForEach-Object {
+    $parts = $_ -split '=', 2; Set-Item "env:$($parts[0])" $parts[1]
 }
-
-# Point the gateway at the data directory (use the absolute path)
+$env:AGENT_TOKEN = az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
 $env:GATEWAY_DATA_DIR = "$PWD\data"
-
-cd packages\gateway
-pnpm exec tsx src/index.ts
+cd packages\gateway && pnpm exec tsx src/index.ts
 ```
 
 **bash:**
 
 ```sh
-# Load secrets from data/.env into the current shell
 set -a && source data/.env && set +a
-
-# Point the gateway at the data directory (use the absolute path)
+export AGENT_TOKEN=$(az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv)
 export GATEWAY_DATA_DIR="$PWD/data"
-
-cd packages/gateway
-pnpm exec tsx src/index.ts
+cd packages/gateway && pnpm exec tsx src/index.ts
 ```
 
 The gateway resolves its config from `$GATEWAY_DATA_DIR/gateway.config.yaml`. Alternatively, set `GATEWAY_CONFIG_PATH` to an absolute path to the config file directly.
-
-> **Note:** `pnpm dev` (defined as `tsx src/index.ts`) does the same thing but requires the same env setup first — it does not load `.env` or set `GATEWAY_DATA_DIR` automatically.
 
 ---
 
