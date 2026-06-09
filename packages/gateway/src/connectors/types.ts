@@ -114,4 +114,38 @@ export interface ConnectorInterface {
    * Connector must NOT call this for null normalize() results.
    */
   onMessage(callback: (msg: NormalizedMessage) => void): void
+
+  // ── Streaming (v1) ────────────────────────────────────────────────────────
+
+  /**
+   * True if this connector can deliver stream chunks to the user progressively.
+   *
+   * When false (or absent), the pipeline buffers all StreamChunks from the
+   * adapter, assembles the full response, and calls send() exactly once — the
+   * same behaviour as v0. This is correct for platforms whose APIs do not
+   * support editing or appending to an in-flight message (e.g. WeChat iLink).
+   *
+   * When true, the pipeline calls sendChunk() for each chunk as it arrives.
+   * The connector is responsible for its own rate-limiting and debouncing.
+   *
+   * Defaults to false when absent.
+   */
+  readonly supportsStreaming?: boolean
+
+  /**
+   * Deliver one stream chunk progressively to the user.
+   * Called only when supportsStreaming is true.
+   *
+   * @param target     The destination chat.
+   * @param chunk      The current StreamChunk (delta + done flag).
+   * @param accumulated The full response text assembled so far (all deltas
+   *                   concatenated). Connectors that edit a message in place
+   *                   (e.g. Slack chat.update) should replace the message
+   *                   content with this value rather than appending delta.
+   */
+  sendChunk?(
+    target: DeliveryTarget,
+    chunk: import('../adapter/types.js').StreamChunk,
+    accumulated: string,
+  ): Promise<void>
 }

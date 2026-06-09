@@ -21,16 +21,23 @@ v0 is **not** a demo. It must be correct within its declared scope: correct conc
 
 ## 2. What Is In Scope
 
-### Layer 1 — Connectors (2)
+### Layer 1 — Connectors (3)
 
-**Connector 1: Telegram**
-- Connection mechanism: long polling (`getUpdates`) — no public URL required, works on a developer laptop
-- Supported chat types: DM and group (with @mention detection)
-- Session key formulas: `v1:telegram:{accountId}:{conversation.id}` (DM), `v1:telegram:{accountId}:{conversation.id}:{sender.id}` (group)
-- Media: inbound images and voice messages passed through to adapter as `MediaItem[]`; outbound text only (no media send in v0)
-- Library: `grammY`
+**Connector 1: WeChat (personal account via iLink Bot API)**
+- Connection mechanism: long-polling (`POST ilink/bot/getupdates`, 35-second server-side timeout) — no public URL required
+- Supported chat types: DM and group (policy-controlled via `dmPolicy` / `groupPolicy`)
+- Session key formulas: `v1:wechat:{accountId}:{fromUserId}` (DM), `v1:wechat:{accountId}:{roomId}:{fromUserId}` (group)
+- Media: inbound descriptors forwarded to adapter; outbound text only in v0
+- Allowlist: optional `allowFrom` field to restrict DM senders
 
-**Connector 2: OpenAI API Compatibility Layer**
+**Connector 2: Slack (Socket Mode)**
+- Connection mechanism: WebSocket via Slack Socket Mode — no public URL required, works on a developer laptop
+- Supported chat types: DM and channel (with @mention detection)
+- Session key formulas: `v1:slack:{accountId}:{channelId}` (DM), `v1:slack:{accountId}:{channelId}:{userId}` (channel)
+- Media: inbound file descriptors forwarded to adapter; outbound text only in v0
+- Library: `@slack/bolt`
+
+**Connector 3: OpenAI API Compatibility Layer**
 - Endpoint: `POST /v1/chat/completions` only
 - Input: standard OpenAI `messages[]` array; the last `user` message becomes `AgentRequest.message`; all prior `messages[]` entries are passed as `messageRaw` for the adapter to use if it wishes; the `model` field is passed through in `platform.name`
 - Session key: `v1:openai-api:{accountId}:{clientSessionId}` where `clientSessionId` is taken from a custom request header `X-Session-Id` if provided, otherwise a random UUID generated per request
@@ -68,7 +75,7 @@ All six pipeline stages are implemented in full. No shortcuts.
 
 **v0 constraint: exactly one adapter per gateway instance.** All connectors route every message to the same single adapter. Multi-adapter routing (e.g. different adapters per connector or per chat type) is a post-v0 feature.
 
-**`HttpAdapter`**: full implementation. This is the primary integration path for all Python agents.
+**`HttpAdapter`**: full implementation. This is the primary integration path for all Python agents, including the Microsoft Foundry hosted agent (using the `openai-responses` protocol variant).
 
 **`EmbeddedAdapter`**: full implementation. Used in tests and for TypeScript-native agents.
 
@@ -121,12 +128,12 @@ POST /run
 Content-Type: application/json
 Authorization: Bearer <token>   (optional)
 
-Body: AgentRequest (snake_case JSON)
+Body: AgentRequest (camelCase JSON — sessionKey, isNew, wasAutoReset, messageRaw, toolPolicy, etc.)
 
 Response 200:
-Body: AgentResponse (snake_case JSON)
+Body: AgentResponse (camelCase JSON — text, media, interrupted)
 
-Response 400: malformed request (Pydantic validation error)
+Response 422: malformed request (Pydantic validation error)
 Response 500: unhandled agent error
 ```
 
@@ -152,7 +159,8 @@ Via environment variables (loaded by `config.py` using Pydantic `BaseSettings`):
 ┌─────────────────────────────────────────────────────────────┐
 │  Layer 1: Connectors                                        │
 │                                                             │
-│  Telegram (grammY, long poll)                               │
+│  WeChat (iLink Bot API, long poll)                          │
+│  Slack (Bolt, Socket Mode WebSocket)                        │
 │  OpenAI API compat (Hono, POST /v1/chat/completions)        │
 └────────────────────────┬────────────────────────────────────┘
                          │ NormalizedMessage
@@ -170,10 +178,15 @@ Via environment variables (loaded by `config.py` using Pydantic `BaseSettings`):
 │  LangGraph StateGraph                                       │
 │  Tools: get_current_time, calculator                        │
 │  History: SQLiteChatMessageHistory (per sessionKey)         │
+│                                                             │
+│  — or —                                                     │
+│                                                             │
+│  Microsoft Foundry hosted agent                             │
+│  (HttpAdapter with protocol: openai-responses)              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-Both connectors share the same gateway core and adapter process. A message from Telegram and a request from the OpenAI API compat layer go through identical pipeline stages and reach the same agent — differentiated only by `AgentRequest.platform.name` and their `sessionKey` prefix. This single-adapter constraint is explicit in v0; multi-adapter routing is deferred to a later version.
+All connectors share the same gateway core and adapter process. A message from WeChat/Slack and a request from the OpenAI API compat layer go through identical pipeline stages and reach the same agent — differentiated only by `AgentRequest.platform.name` and their `sessionKey` prefix. This single-adapter constraint is explicit in v0; multi-adapter routing is deferred to a later version.
 
 ---
 
@@ -181,9 +194,9 @@ Both connectors share the same gateway core and adapter process. A message from 
 
 | Feature | Reason deferred |
 |---|---|
-| Slack connector | Requires a public URL (Socket Mode needs an App-level token with specific setup); Telegram long polling is simpler for initial validation |
+| Telegram connector | Replaced by WeChat + Slack as the v0 validation connectors |
 | MS Teams connector | CJS interop complexity; requires Azure Bot registration — deferred to v1 |
-| Discord connector | Low priority relative to Telegram for initial validation |
+| Discord connector | Low priority relative to WeChat/Slack for initial validation |
 | `POST /v1/responses` (OpenAI Responses protocol) | Streaming and stateful response objects add complexity; `/v1/chat/completions` covers the majority of clients |
 | Streaming responses (`stream: true`) | Requires SSE / chunked transfer; significant added complexity in both gateway and adapter |
 | Media send (outbound) | Gateway receives and forwards inbound media to adapter; adapter returning `media[]` in response is not delivered in v0 |
@@ -204,28 +217,31 @@ v0 is considered complete when all of the following pass:
 
 ### Gateway core
 
-- [ ] A message sent to the Telegram bot in a DM is routed to the adapter and the response is delivered back to the same chat
-- [ ] A message sent to the Telegram bot in a group (with @mention) is routed correctly; a message without @mention is silently observed (not dispatched)
-- [ ] A `POST /v1/chat/completions` request returns a valid OpenAI-format JSON response populated from the adapter
-- [ ] Sending a second message while the adapter is processing the first aborts the first and queues the second
-- [ ] Sending a third message while the second is pending replaces the pending item and sends the supersede notification to the user
-- [ ] `/stop` aborts an active run; the user receives no response for the aborted turn
-- [ ] `/new` resets the session; the next turn has `isNew: true` and `wasAutoReset: true`
-- [ ] A session idle for longer than `idleTimeoutMs` sets `wasAutoReset: true` on the next turn
-- [ ] Typing indicator is active during adapter processing and stops when the response is delivered
-- [ ] Gateway restarts Telegram long polling after a simulated network disconnect
+- [x] A message sent to the WeChat bot in a DM is routed to the adapter and the response is delivered back to the same chat
+- [x] A message sent to the WeChat bot in a group is routed correctly when `groupPolicy` is `open`; a DM from an un-allowlisted sender is dropped when `dmPolicy` is `allowlist`
+- [x] A message sent to the Slack bot in a DM is routed to the adapter and the response is delivered back to the same chat
+- [x] A message sent to the Slack bot in a channel (with @mention) is routed correctly; a message without @mention is silently observed
+- [x] A `POST /v1/chat/completions` request returns a valid OpenAI-format JSON response populated from the adapter
+- [x] Sending a second message while the adapter is processing the first aborts the first and queues the second
+- [x] Sending a third message while the second is pending replaces the pending item and sends the supersede notification to the user
+- [x] `/stop` aborts an active run; the user receives no response for the aborted turn
+- [x] `/new` resets the session; the next turn has `isNew: true` and `wasAutoReset: true`
+- [x] A session idle for longer than `idleTimeoutMs` sets `wasAutoReset: true` on the next turn
+- [x] Typing indicator is active during adapter processing and stops when the response is delivered
+- [ ] Gateway reconnects WeChat long-polling after a network disconnect (connector-level retry loop — post-v0)
+- [ ] Gateway reconnects Slack Socket Mode after a WebSocket drop (`watchHealth` crash-restart is implemented; Bolt's built-in reconnect handles transient drops, but sustained disconnect recovery is not explicitly tested)
 
 ### Reference agent
 
-- [ ] Agent responds to a plain message with a contextually appropriate reply
-- [ ] Agent correctly uses `get_current_time` tool when asked for the current time
-- [ ] Agent correctly uses `calculator` tool for arithmetic
-- [ ] Agent greets the user on `isNew: true` and acknowledges a reset on `wasAutoReset: true`
-- [ ] Conversation history is persisted: a follow-up message referencing a prior turn is answered correctly after a gateway restart
-- [ ] History is cleared when `isNew: true` (new session starts fresh)
+- [x] Agent responds to a plain message with a contextually appropriate reply
+- [x] Agent correctly uses `get_current_time` tool when asked for the current time
+- [x] Agent correctly uses `calculator` tool for arithmetic
+- [x] Agent greets the user on `isNew: true` and acknowledges a reset on `wasAutoReset: true`
+- [x] Conversation history is persisted: a follow-up message referencing a prior turn is answered correctly after a gateway restart
+- [x] History is cleared when `isNew: true` (new session starts fresh)
 
 ### Error handling
 
-- [ ] An invalid `gateway.config.yaml` causes a startup error with a clear message and exit code 1
-- [ ] An adapter that returns a 500 results in an error message to the user, not a silent failure
-- [ ] An adapter that takes longer than `adapterTimeoutMs` results in a timeout message to the user and the session slot is released
+- [x] An invalid `gateway.config.yaml` causes a startup error with a clear message and exit code 1
+- [x] An adapter that returns a 500 results in an error message to the user, not a silent failure
+- [x] An adapter that takes longer than `adapterTimeoutMs` results in a timeout message to the user and the session slot is released

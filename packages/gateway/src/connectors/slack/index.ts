@@ -7,6 +7,7 @@
 
 import { App, LogLevel } from '@slack/bolt'
 import type { ConnectorInterface, NormalizedMessage, DeliveryTarget, DeliveryResult, MediaItem } from '../types.js'
+import type { StreamChunk } from '../../adapter/types.js'
 import type { SlackConnectorConfig } from '../../config/schema.js'
 import { normalize, type SlackMessageEvent } from './normalize.js'
 import { deriveSessionKey } from './session-key.js'
@@ -18,15 +19,22 @@ type NormalizedMessageWithKey = NormalizedMessage & { sessionKey: string }
 // Slack message length limit (in characters). Messages longer than this are split.
 const SLACK_MAX_MSG_LENGTH = 3000
 
+// Slack progressive streaming: minimum ms between chat.update calls (≤ 2/s per Slack rate limit).
+const SLACK_UPDATE_INTERVAL_MS = 600
+
 export class SlackConnector implements ConnectorInterface {
   readonly type = 'slack'
   readonly accountId: string
+  readonly supportsStreaming = true
 
   private app: App
   private config: SlackConnectorConfig
   private messageCallback: ((msg: NormalizedMessage) => void) | null = null
   private healthy = false
   private botUserId: string | null = null
+
+  // Per-turn streaming state (keyed by chatId:ts to support concurrent turns).
+  private streamingState = new Map<string, StreamingState>()
 
   constructor(config: SlackConnectorConfig) {
     this.accountId = config.accountId
@@ -204,6 +212,104 @@ export class SlackConnector implements ConnectorInterface {
     // The Web API has no equivalent of sendChatAction('typing').
   }
 
+  /**
+   * Progressive streaming delivery via chat.postMessage + chat.update.
+   *
+   * First chunk: posts a new message (captures `ts` for subsequent edits).
+   * Intermediate chunks: debounced chat.update — at most once per
+   *   SLACK_UPDATE_INTERVAL_MS to stay within Slack rate limits (≤ 2/s).
+   * Final chunk (done=true): always flushes the final accumulated text.
+   *
+   * State is keyed by chatId so concurrent sessions don't interfere.
+   */
+  async sendChunk(
+    target: DeliveryTarget,
+    chunk: StreamChunk,
+    accumulated: string,
+  ): Promise<void> {
+    const stateKey = target.chatId
+    let state = this.streamingState.get(stateKey)
+
+    if (state == null) {
+      // First chunk — post a new message and capture its ts.
+      const result = await this.app.client.chat.postMessage({
+        channel: target.chatId,
+        text: accumulated || '…',
+        ...(target.replyToMessageId != null ? { thread_ts: target.replyToMessageId } : {}),
+      })
+      state = {
+        ts: result.ts as string,
+        lastUpdateAt: Date.now(),
+        pendingText: null,
+        pendingTimer: null,
+      }
+      this.streamingState.set(stateKey, state)
+      logger.debug(
+        { accountId: this.accountId, chatId: target.chatId, ts: state.ts },
+        'SlackConnector: streaming message posted',
+      )
+      if (chunk.done) {
+        this.streamingState.delete(stateKey)
+      }
+      return
+    }
+
+    if (chunk.done) {
+      // Final chunk — cancel any pending debounce and flush now.
+      if (state.pendingTimer != null) {
+        clearTimeout(state.pendingTimer)
+        state.pendingTimer = null
+      }
+      this.streamingState.delete(stateKey)
+      if (accumulated) {
+        await this._updateMessage(target.chatId, state.ts, accumulated)
+      }
+      return
+    }
+
+    // Intermediate chunk — debounce updates.
+    const now = Date.now()
+    const elapsed = now - state.lastUpdateAt
+    if (elapsed >= SLACK_UPDATE_INTERVAL_MS) {
+      // Enough time has passed — update immediately.
+      if (state.pendingTimer != null) {
+        clearTimeout(state.pendingTimer)
+        state.pendingTimer = null
+      }
+      state.lastUpdateAt = now
+      await this._updateMessage(target.chatId, state.ts, accumulated)
+    } else {
+      // Too soon — schedule a deferred update with the latest accumulated text.
+      state.pendingText = accumulated
+      if (state.pendingTimer == null) {
+        state.pendingTimer = setTimeout(() => {
+          if (state == null) return
+          state.pendingTimer = null
+          const text = state.pendingText ?? ''
+          state.pendingText = null
+          state.lastUpdateAt = Date.now()
+          if (text) {
+            void this._updateMessage(target.chatId, state.ts, text).catch((err) => {
+              logger.warn({ accountId: this.accountId, chatId: target.chatId, err }, 'SlackConnector: deferred chat.update failed')
+            })
+          }
+        }, SLACK_UPDATE_INTERVAL_MS - elapsed)
+      }
+    }
+  }
+
+  private async _updateMessage(chatId: string, ts: string, text: string): Promise<void> {
+    try {
+      await this.app.client.chat.update({ channel: chatId, ts, text })
+      logger.debug(
+        { accountId: this.accountId, chatId, ts },
+        'SlackConnector: streaming message updated',
+      )
+    } catch (err) {
+      logger.warn({ accountId: this.accountId, chatId, ts, err }, 'SlackConnector: chat.update failed')
+    }
+  }
+
   onMessage(callback: (msg: NormalizedMessage) => void): void {
     this.messageCallback = callback
   }
@@ -226,4 +332,15 @@ function splitText(text: string, maxLen: number): string[] {
   }
   if (remaining) chunks.push(remaining)
   return chunks
+}
+
+interface StreamingState {
+  /** Slack `ts` of the in-flight streaming message. */
+  ts: string
+  /** Timestamp of the last chat.update call (ms). */
+  lastUpdateAt: number
+  /** Accumulated text queued for the next debounced update. */
+  pendingText: string | null
+  /** Timer handle for the debounced update. */
+  pendingTimer: ReturnType<typeof setTimeout> | null
 }

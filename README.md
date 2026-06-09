@@ -36,6 +36,7 @@ agent-gateway/
 │   │       ├── connectors/   # wechat/, telegram/, openai-api/
 │   │       ├── core/         # pipeline/, session/, commands/
 │   │       ├── adapter/      # http.ts, embedded.ts, types.ts
+│   │       ├── admin/        # config dashboard + hot-reload control plane
 │   │       └── config/       # schema.ts, loader.ts
 │   ├── sdk-ts/               # npm: @agent-gateway/sdk
 │   ├── sdk-py/               # PyPI: agent-gateway-sdk
@@ -229,6 +230,106 @@ cd packages/gateway && pnpm exec tsx src/index.ts
 ```
 
 The gateway resolves its config from `$GATEWAY_DATA_DIR/gateway.config.yaml`. Alternatively, set `GATEWAY_CONFIG_PATH` to an absolute path to the config file directly.
+
+---
+
+## Running with Docker
+
+The repo ships a multi-stage [`Dockerfile`](Dockerfile) that produces a small, self-contained runtime image (Node 22, `better-sqlite3` prebuilt) plus a [`docker-compose.yml`](docker-compose.yml) for single-host runs.
+
+The image expects the same two inputs as a local run, both supplied through the mounted `data/` directory:
+
+- `data/gateway.config.yaml` — your active config (gitignored; supply your own)
+- `data/.env` — secrets referenced via `${VAR}` interpolation (copy from `data/.env.example`)
+
+### Build
+
+```sh
+docker build -t agent-gateway:latest .
+```
+
+### Run
+
+**bash / macOS / Linux:**
+
+```sh
+docker run --rm -p 3000:3000 \
+  -e GATEWAY_DATA_DIR=/app/data \
+  -v "$PWD/data:/app/data" \
+  --env-file data/.env \
+  agent-gateway:latest
+```
+
+**Windows (PowerShell):**
+
+```powershell
+docker run --rm -p 3000:3000 `
+  -e GATEWAY_DATA_DIR=/app/data `
+  -v "${PWD}\data:/app/data" `
+  --env-file data\.env `
+  agent-gateway:latest
+```
+
+The volume mount persists the SQLite session/audit DB and WeChat sync state across restarts. Port `3000` is only required for inbound webhooks (Teams, OpenAI-API compat) — Slack (Socket Mode), WeChat (long-poll) and Telegram (poll) are outbound-only.
+
+### Docker Compose
+
+```sh
+# 1. Copy data/.env.example -> data/.env and fill in secrets
+# 2. Ensure data/gateway.config.yaml exists
+docker compose up --build
+```
+
+Compose wires the `data/` volume, `--env-file`, port mapping, the `/health` healthcheck, and `restart: unless-stopped` automatically.
+
+> **Note on `AGENT_TOKEN`:** for Azure AD–backed HTTP adapters the token is a short-lived JWT and is *not* suitable for a static `.env`. Refresh it externally (sidecar/secret manager) or use a non-AAD adapter token.
+
+---
+
+## Configuration dashboard
+
+The gateway includes an optional embedded web dashboard for inspecting and **hot-editing** config at runtime — no restart needed for most changes. It is **secure by default**: the entire `/admin` surface returns `404` unless an admin token is configured.
+
+### Enable it
+
+Set `GATEWAY_ADMIN_TOKEN` in the environment (e.g. in `data/.env`):
+
+```env
+# Enables the /admin dashboard + management API. Long, random, secret.
+GATEWAY_ADMIN_TOKEN=your-long-random-admin-token
+
+# Optional: explicit session-cookie signing secret (defaults to a value derived
+# from the admin token). Set to rotate sessions independently of the token.
+GATEWAY_ADMIN_SESSION_SECRET=
+
+# Optional: set to 'false' to allow the session cookie over plain HTTP for local
+# testing (default secure=true requires HTTPS).
+GATEWAY_ADMIN_COOKIE_SECURE=
+```
+
+Then open `http://localhost:3000/admin` and log in with the token. The login issues a signed, HttpOnly session cookie (1h sliding expiry).
+
+### What it does
+
+| Tab | Capability |
+|---|---|
+| Overview | Boot time, version, adapter type, live connector status |
+| Connectors | List connectors, view health, restart individually |
+| Adapter | View current adapter, run a connectivity test, restart |
+| Config | Edit the raw `gateway.config.yaml`, validate, and apply with rollback |
+| Environment | View, add, edit, and delete variables in `data/.env` (takes effect on container recreate) |
+| Sessions | Inspect recent active sessions |
+| Audit | Recent audit-log entries, including config changes |
+
+### Hot-reload semantics
+
+When you apply a config change, only what actually changed is reloaded:
+
+- **Connectors** — added / removed / changed connectors are diffed and reconciled individually (in-flight turns drain first). Unchanged connectors are untouched.
+- **`http` adapter** — hot-swapped live (new turns use the new target; in-flight turns drain).
+- **Adapter *type* changes** (e.g. `http` → `embedded`) or embedded-adapter changes — flagged as `requiresRestart`; apply, then restart the process.
+
+Secrets are **redacted on read** (shown as `••••` or preserved as `${ENV}` references) and **never** leaked to the UI in plaintext. On write, unchanged masked secrets are restored automatically, so you can edit non-secret fields without re-entering credentials.
 
 ---
 

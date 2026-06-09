@@ -39,6 +39,9 @@ export class AdapterError extends GatewayError {}
 /** adapter.run() did not return within the configured deadline */
 export class AdapterTimeoutError extends AdapterError {}
 
+/** adapter.run() was aborted by an explicit user action (e.g. /stop) — no error message should be sent to the user */
+export class AdapterAbortedError extends AdapterError {}
+
 /** Approval not received within approvalTimeoutMs */
 export class ApprovalTimeoutError extends GatewayError {}
 

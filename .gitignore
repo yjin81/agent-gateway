@@ -23,11 +23,16 @@ build/
 .env.*
 !.env.example
 
-# Gateway runtime data
+# Gateway runtime data (written under dataDir — default ./data/)
 data/
 *.db
 *.db-shm
 *.db-wal
+# Runtime artifacts, caught regardless of dataDir location
+weixin/
+*.bak
+*.tmp
+*.sync.json
 
 # Logs
 *.log

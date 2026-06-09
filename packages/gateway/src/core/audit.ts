@@ -63,4 +63,53 @@ export class AuditLog {
       logger.error({ err, entry }, 'AuditLog: failed to append entry')
     }
   }
+
+  /**
+   * Record an admin config-change event. Reuses the audit_log table: the
+   * `platform` column carries "admin", `message_id` carries the change summary,
+   * and `error` carries an optional failure reason.
+   */
+  appendConfigChange(summary: string, outcome: TurnOutcome = 'handled', error?: string): void {
+    this.append({
+      timestamp: Date.now(),
+      sessionKey: 'admin',
+      platform: 'admin',
+      accountId: 'admin',
+      outcome,
+      messageId: summary,
+      durationMs: 0,
+      ...(error != null ? { error } : {}),
+    })
+  }
+
+  /** Return the most recent audit entries (newest first). Soft read. */
+  recent(limit = 100): AuditEntry[] {
+    try {
+      const rows = this.db
+        .prepare<[number], {
+          timestamp: number
+          session_key: string
+          platform: string
+          account_id: string
+          outcome: string
+          message_id: string
+          duration_ms: number
+          error: string | null
+        }>('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?')
+        .all(limit)
+      return rows.map((r) => ({
+        timestamp: r.timestamp,
+        sessionKey: r.session_key,
+        platform: r.platform,
+        accountId: r.account_id,
+        outcome: r.outcome as TurnOutcome,
+        messageId: r.message_id,
+        durationMs: r.duration_ms,
+        ...(r.error != null ? { error: r.error } : {}),
+      }))
+    } catch (err) {
+      logger.error({ err }, 'AuditLog: failed to read recent entries')
+      return []
+    }
+  }
 }

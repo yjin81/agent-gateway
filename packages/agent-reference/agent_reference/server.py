@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 
 from agent_gateway.types import AgentRequest, AgentResponse
 from .agent import run_agent
+from .config import settings
 
 app = FastAPI(title="Agent Reference", version="0.1.0")
+
+
+@app.middleware("http")
+async def bearer_auth(request: Request, call_next):
+    """Enforce bearer token when AGENT_BEARER_TOKEN is configured."""
+    if settings.agent_bearer_token is not None:
+        auth = request.headers.get("Authorization", "")
+        expected = f"Bearer {settings.agent_bearer_token}"
+        if auth != expected:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"detail": "Unauthorized"},
+            )
+    return await call_next(request)
 
 
 @app.post("/run", response_model=AgentResponse)
@@ -32,4 +48,4 @@ def health() -> dict[str, str]:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=settings.agent_port)

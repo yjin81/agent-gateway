@@ -2,16 +2,9 @@
 
 import { loadConfigFile, resolveConfigPath } from './config/loader.js'
 import { GatewayRunner } from './core/gateway.js'
-import { TelegramConnector } from './connectors/telegram/index.js'
-import { OpenAIApiConnector } from './connectors/openai-api/index.js'
-import { WechatConnector } from './connectors/wechat/index.js'
-import { SlackConnector } from './connectors/slack/index.js'
-import { HttpAdapter } from './adapter/http.js'
-import { EmbeddedAdapter } from './adapter/embedded.js'
-import type { AgentAdapter } from './adapter/types.js'
-import type { ConnectorInterface } from './connectors/types.js'
+import { buildConnectors, buildAdapter } from './core/factory.js'
+import { ConfigStore } from './admin/config-store.js'
 import type { GatewayConfig } from './config/schema.js'
-import { logger } from './lib/logger.js'
 import { ConfigValidationError } from './lib/errors.js'
 
 async function main(): Promise<void> {
@@ -30,48 +23,27 @@ async function main(): Promise<void> {
   }
 
   // Build connectors.
-  const connectors: ConnectorInterface[] = []
   const dataDir = config.gateway.dataDir
-  for (const connectorConfig of config.connectors) {
-    switch (connectorConfig['type']) {
-      case 'telegram':
-        connectors.push(new TelegramConnector(connectorConfig))
-        break
-      case 'openai-api':
-        connectors.push(new OpenAIApiConnector(connectorConfig))
-        break
-      case 'wechat':
-        connectors.push(new WechatConnector(connectorConfig, dataDir))
-        break
-    case 'slack':
-        connectors.push(new SlackConnector(connectorConfig))
-        break
-      case 'teams':
-        logger.warn({ accountId: connectorConfig['accountId'] }, 'Teams connector is v1 — not yet implemented')
-        break
-    }
-  }
+  const connectors = buildConnectors(config.connectors, dataDir)
 
   // Build adapter.
-  let adapter: AgentAdapter
-  if (config.adapter.type === 'http') {
-    const adapterConfig = config.adapter
-    adapter = new HttpAdapter(
-      adapterConfig.url,
-      adapterConfig.bearerTokenEnv != null
-        ? async () => process.env[adapterConfig.bearerTokenEnv!] ?? ''
-        : undefined,
-      { protocol: adapterConfig.protocol, ...(adapterConfig.model != null ? { model: adapterConfig.model } : {}) },
-    )
-  } else {
-    // embedded — dynamically import the module.
-    const embeddedConfig = config.adapter
-    const mod = await import(embeddedConfig.module)
-    const inner = (mod.default ?? mod) as AgentAdapter
-    adapter = new EmbeddedAdapter(inner)
+  const adapter = await buildAdapter(config.adapter)
+
+  // Load the raw config store for the admin control plane (best-effort; the
+  // admin surface stays off unless GATEWAY_ADMIN_TOKEN is also set).
+  let configStore: ConfigStore | undefined
+  try {
+    configStore = await ConfigStore.load(configPath)
+  } catch (err) {
+    console.error(`[warn] Admin config store unavailable: ${String(err)}`)
   }
 
-  const runner = new GatewayRunner({ config, connectors, adapter })
+  const runner = new GatewayRunner({
+    config,
+    connectors,
+    adapter,
+    ...(configStore != null ? { configStore } : {}),
+  })
   await runner.start()
 }
 

@@ -13,12 +13,18 @@ For Python agents, use [`HttpAdapter`](http.md) pointed at a FastAPI process ins
 
 ## How it works
 
-`EmbeddedAdapter` is a thin wrapper. It holds a reference to any object that implements `AgentAdapter` and delegates `run()` and `onSessionReset()` to it:
+`EmbeddedAdapter` is a thin wrapper. It holds a reference to any object that implements `AgentAdapter` and delegates `run()`, `stream()`, and `onSessionReset()` to it:
 
 ```ts
-// adapter/embedded.ts
 export class EmbeddedAdapter implements AgentAdapter {
-  constructor(private readonly inner: AgentAdapter) {}
+  stream?: (request: AgentRequest) => AsyncIterable<StreamChunk>
+
+  constructor(private readonly inner: AgentAdapter) {
+    // Only expose stream() if the inner adapter implements it.
+    if (inner.stream != null) {
+      this.stream = (request) => inner.stream!(request)
+    }
+  }
 
   run(request: AgentRequest): Promise<AgentResponse> {
     return this.inner.run(request)
@@ -30,7 +36,9 @@ export class EmbeddedAdapter implements AgentAdapter {
 }
 ```
 
-The gateway always calls `adapter.run()` — whether that adapter is `HttpAdapter`, `EmbeddedAdapter`, or any custom implementation makes no difference to the pipeline.
+`stream()` is only present on the `EmbeddedAdapter` instance when the inner adapter implements it. The pipeline checks `adapter.stream != null` before taking the streaming path — so if the inner adapter has no `stream()` method, behaviour is identical to v0 (single `run()` call, complete response delivered at once).
+
+The gateway calls `adapter.run()` or `adapter.stream()` depending on whether the connector supports streaming — whether that adapter is `HttpAdapter`, `EmbeddedAdapter`, or any custom implementation makes no difference to the pipeline.
 
 ---
 
@@ -98,10 +106,27 @@ await runner.start()
 interface AgentAdapter {
   run(request: AgentRequest): Promise<AgentResponse>
 
+  /**
+   * Optional streaming path. When present, the pipeline calls stream() in
+   * preference to run() and routes chunks to the connector.
+   * The iterable must yield one or more chunks with done: false, then exactly
+   * one final chunk with done: true. It must honour request.abortSignal.
+   */
+  stream?(request: AgentRequest): AsyncIterable<StreamChunk>
+
   // Optional — called when wasAutoReset = true
   onSessionReset?(sessionKey: string): Promise<void>
 }
 ```
+
+### `StreamChunk`
+
+| Field | Type | Description |
+|---|---|---|
+| `delta` | `string` | Token text to append to the accumulated response. May be empty on the final chunk. |
+| `done` | `boolean` | True on the last chunk — no further chunks will follow. |
+| `interrupted` | `boolean?` | Populated only on the final chunk. True if `abortSignal` fired mid-stream. |
+| `media` | `MediaItem[]?` | Media attachments. Populated only on the final chunk. |
 
 ### `AgentRequest`
 
@@ -168,3 +193,46 @@ async run(request: AgentRequest): Promise<AgentResponse> {
 ```
 
 The gateway sends the prompt to the platform chat, pauses the typing indicator, and waits for `/approve` or `/deny`. The `approvalCallback` resolves to `'denied'` if the user does not respond within `approvalTimeoutMs` (default 5 minutes).
+
+---
+
+## Implementing `stream()` for progressive delivery
+
+If the connector supports streaming (e.g. Slack), implement `stream()` on your inner agent to deliver tokens as they are generated:
+
+```ts
+import type { AgentAdapter, AgentRequest, AgentResponse, StreamChunk } from '@agent-gateway/sdk'
+
+export class MyStreamingAgent implements AgentAdapter {
+  async run(request: AgentRequest): Promise<AgentResponse> {
+    // Fallback — assembles the full response when the connector does not stream.
+    const chunks: string[] = []
+    for await (const chunk of this.stream(request)) {
+      chunks.push(chunk.delta)
+      if (chunk.done) break
+    }
+    return { text: chunks.join(''), media: [], interrupted: false }
+  }
+
+  async *stream(request: AgentRequest): AsyncIterable<StreamChunk> {
+    const tokens = await generateTokens(request.message)  // your LLM call
+    for (const token of tokens) {
+      if (request.abortSignal.aborted) {
+        yield { delta: '', done: true, interrupted: true, media: [] }
+        return
+      }
+      yield { delta: token, done: false }
+    }
+    yield { delta: '', done: true, interrupted: false, media: [] }
+  }
+}
+```
+
+Rules for `stream()` implementors:
+
+- Yield one or more chunks with `done: false`, then **exactly one** final chunk with `done: true`.
+- Set `interrupted: true` on the final chunk if `abortSignal` fired.
+- Populate `media` only on the final chunk.
+- Never throw after the first chunk — yield a `done: true` chunk instead.
+
+When `stream()` is not implemented, `EmbeddedAdapter` does not expose the method and the pipeline uses `run()` instead — no streaming, identical to v0.

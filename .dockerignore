@@ -1,0 +1,36 @@
+# Dependencies (reinstalled inside the image)
+**/node_modules
+
+# Build output (rebuilt inside the image)
+**/dist
+
+# Runtime state & secrets — never bake into the image
+data/
+# …except the config file, which is baked in (secrets stay as ${ENV_VAR} refs)
+!data/gateway.config.yaml
+**/*.db
+**/*.db-shm
+**/*.db-wal
+# Runtime artifacts, caught regardless of dataDir location
+**/weixin/
+**/*.bak
+**/*.sync.json
+.env
+**/.env
+
+# VCS / tooling
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# Local scripts / docs not needed at build time
+start-gateway.ps1
+wechat_login.py
+*.md
+docs/
+
+# OS noise
+.DS_Store
+Thumbs.db

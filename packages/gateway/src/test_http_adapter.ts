@@ -14,7 +14,7 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { loadConfigFile } from './config/loader.js'
-import { HttpAdapter } from './adapter/http.js'
+import { HttpAdapter } from './adapter/http/index.js'
 import type { AgentRequest, AgentResponse } from './adapter/types.js'
 
 // ── Colours ───────────────────────────────────────────────────────────────────

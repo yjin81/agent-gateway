@@ -1,0 +1,40 @@
+# docker-compose.yml — local / single-host run of the Agent Gateway.
+#
+#   1. Copy data/.env.example -> data/.env and fill in secrets.
+#   2. Ensure data/gateway.config.yaml exists (the gateway reads it from the
+#      mounted data dir; it is gitignored so supply your own).
+#   3. docker compose up --build
+#
+# Port 3000 is only required for inbound webhooks (Teams /connectors/teams,
+# OpenAI-API /v1). Slack (Socket Mode), WeChat (long-poll) and Telegram (poll)
+# are outbound-only and work without any exposed port.
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agent-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      GATEWAY_DATA_DIR: /app/data
+      GATEWAY_LOG_LEVEL: info
+      # GATEWAY_CONFIG_PATH: /app/data/gateway.config.yaml  # optional override
+    # Long-lived connector/adapter secrets (WECHAT_*, SLACK_*, AGENT_*, Teams).
+    # NOTE: AGENT_TOKEN (short-lived Azure AD JWT) is NOT suitable for a static
+    # .env — supply it via a sidecar/secret refresh or use a non-AAD adapter.
+    env_file:
+      - data/.env
+    volumes:
+      # Persist SQLite session/audit DB + WeChat sync/context-token state,
+      # and provide gateway.config.yaml.
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

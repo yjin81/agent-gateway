@@ -1,4 +1,4 @@
-// core/gateway.ts — GatewayRunner: lifecycle, connector wiring, reconnect loop
+// core/gateway.ts — GatewayRunner: lifecycle, HTTP server, supervisor + admin wiring
 
 import Database from 'better-sqlite3'
 import { resolve } from 'node:path'
@@ -8,49 +8,68 @@ import { Hono } from 'hono'
 
 import type { ConnectorInterface } from '../connectors/types.js'
 import type { AgentAdapter } from '../adapter/types.js'
-import type { GatewayConfig } from '../config/schema.js'
+import type { GatewayConfig, ConnectorConfig } from '../config/schema.js'
 import { SessionRegistry } from './session/registry.js'
 import { SessionRunRegistry } from './session/run-slot.js'
 import { AuditLog } from './audit.js'
 import { runTurn } from './pipeline/index.js'
+import { ConnectorSupervisor } from '../admin/supervisor.js'
+import { AdapterManager } from '../admin/adapter-manager.js'
+import { AdminAuth } from '../admin/auth.js'
+import { mountAdmin } from '../admin/index.js'
+import type { ConfigStore } from '../admin/config-store.js'
+import { EnvStore } from '../admin/env-store.js'
 import { logger, setLogLevel } from '../lib/logger.js'
 
-const RECONNECT_BASE_MS = 1_000
-const RECONNECT_MAX_MS = 60_000
+const GATEWAY_VERSION = '1.0.0'
 
 /** Connectors that expose a Hono sub-app for webhook/HTTP handling. */
 interface WebhookConnector extends ConnectorInterface {
   readonly app: Hono
-  /** Mount path prefix, e.g. '/v1' or '/webhooks/wechat-oa' */
-  readonly webhookMountPath?: string
 }
 
 function isWebhookConnector(c: ConnectorInterface): c is WebhookConnector {
   return 'app' in c && (c as WebhookConnector).app instanceof Hono
 }
 
+/** Resolve a webhook connector's mount path from its config (duck-typed). */
+function mountPathFor(connector: ConnectorInterface): string {
+  const cfg = (connector as unknown as { config?: { webhookPath?: string; listenPath?: string } }).config
+  return cfg?.webhookPath ?? cfg?.listenPath ?? `/${connector.type}`
+}
+
 export interface GatewayRunnerOptions {
   config: GatewayConfig
   connectors: ConnectorInterface[]
   adapter: AgentAdapter
+  /** Enables the admin control plane (hot-reload). When absent, admin is off. */
+  configStore?: ConfigStore
+  /** If true, skip registering SIGTERM/SIGINT handlers. Useful in tests. */
+  skipSignalHandlers?: boolean
 }
 
 export class GatewayRunner {
   private config: GatewayConfig
-  private connectors: ConnectorInterface[]
-  private adapter: AgentAdapter
+  private readonly initialConnectors: ConnectorInterface[]
+  private adapterManager: AdapterManager
   private sessionRegistry!: SessionRegistry
   private runRegistry: SessionRunRegistry
   private auditLog!: AuditLog
+  private supervisor!: ConnectorSupervisor
   private approvalMap = new Map<string, (result: 'approved' | 'denied') => void>()
   private stopped = false
   private httpServer: ReturnType<typeof serve> | null = null
+  private readonly configStore: ConfigStore | undefined
+  private readonly skipSignalHandlers: boolean
+  private readonly bootTime = Date.now()
 
   constructor(opts: GatewayRunnerOptions) {
     this.config = opts.config
-    this.connectors = opts.connectors
-    this.adapter = opts.adapter
+    this.initialConnectors = opts.connectors
+    this.adapterManager = new AdapterManager(opts.adapter)
     this.runRegistry = new SessionRunRegistry()
+    this.configStore = opts.configStore
+    this.skipSignalHandlers = opts.skipSignalHandlers ?? false
   }
 
   async start(): Promise<void> {
@@ -71,20 +90,46 @@ export class GatewayRunner {
 
     logger.info({ dataDir, dbPath }, 'GatewayRunner: starting')
 
-    // Build the shared Hono HTTP server and mount webhook connector sub-apps.
+    // Build the connector supervisor with the turn dispatch handler.
+    this.supervisor = new ConnectorSupervisor({
+      dataDir,
+      shutdownTimeoutMs: this.config.gateway.shutdownTimeoutMs,
+      onMessage: (connector, msg) =>
+        runTurn(msg, {
+          connector,
+          adapter: this.adapterManager,
+          sessionRegistry: this.sessionRegistry,
+          runRegistry: this.runRegistry,
+          auditLog: this.auditLog,
+          config: this.config,
+          approvalMap: this.approvalMap,
+        }),
+    })
+
+    // Build the shared Hono HTTP server (webhook dispatch + admin).
     this.startHttpServer()
 
-    // Start connectors with reconnect loop.
-    for (const connector of this.connectors) {
-      this.wireConnector(connector)
-      await this.startWithReconnect(connector)
+    // Start connectors (paired with their config by index — index.ts builds
+    // connectors from config.connectors in order).
+    const entries = this.initialConnectors.map((connector, i) => ({
+      connector,
+      config: this.config.connectors[i] as ConnectorConfig,
+    }))
+    await this.supervisor.startAll(entries)
+
+    // Boot fail-fast: a connector left in `error` after startup is fatal at boot.
+    const failed = this.supervisor.getStatuses().filter((s) => s.status === 'error')
+    if (failed.length > 0 && !this.skipSignalHandlers) {
+      logger.fatal({ failed }, 'GatewayRunner: connector(s) failed to start')
+      process.exit(1)
     }
 
-    // Graceful shutdown handler.
-    process.on('SIGTERM', () => void this.stop())
-    process.on('SIGINT', () => void this.stop())
-
     logger.info('GatewayRunner: all connectors started')
+
+    if (!this.skipSignalHandlers) {
+      process.on('SIGTERM', () => void this.stop())
+      process.on('SIGINT', () => void this.stop())
+    }
   }
 
   private startHttpServer(): void {
@@ -93,83 +138,55 @@ export class GatewayRunner {
       ? parseInt(process.env['PORT'], 10)
       : this.config.http.port
 
-    // Mount each webhook-capable connector onto its path.
-    for (const connector of this.connectors) {
-      if (!isWebhookConnector(connector)) continue
-
-      // Determine mount path:
-      //   - WechatOaConnector: config.webhookPath (default /webhooks/wechat-oa)
-      //   - OpenAIApiConnector: config.listenPath (default /v1)
-      // Both are stored in the connector config; we access via the config store
-      // on the connector itself. Use a duck-type check for the path property.
-      const mountPath =
-        (connector as unknown as { config?: { webhookPath?: string; listenPath?: string } })
-          .config?.webhookPath ??
-        (connector as unknown as { config?: { webhookPath?: string; listenPath?: string } })
-          .config?.listenPath ??
-        `/${connector.type}`
-
-      root.route(mountPath, connector.app)
-      logger.info(
-        { accountId: connector.accountId, mountPath },
-        'GatewayRunner: mounted webhook connector',
-      )
+    if (port === 0) {
+      logger.debug('GatewayRunner: HTTP server skipped (port=0)')
+      return
     }
 
     root.get('/health', (c) => c.json({ status: 'ok' }))
 
+    // Admin control plane (secure by default — only when a token is configured).
+    const auth = new AdminAuth({
+      token: process.env['GATEWAY_ADMIN_TOKEN'],
+      sessionSecret: process.env['GATEWAY_ADMIN_SESSION_SECRET'],
+    })
+    if (auth.enabled && this.configStore != null) {
+      mountAdmin(root, {
+        auth,
+        configStore: this.configStore,
+        envStore: new EnvStore(resolve(this.config.gateway.dataDir, '.env')),
+        supervisor: this.supervisor,
+        adapterManager: this.adapterManager,
+        sessionRegistry: this.sessionRegistry,
+        auditLog: this.auditLog,
+        config: this.config,
+        bootTime: this.bootTime,
+        version: GATEWAY_VERSION,
+        cookieSecure: process.env['GATEWAY_ADMIN_COOKIE_SECURE'] !== 'false',
+      })
+    } else if (auth.enabled && this.configStore == null) {
+      logger.warn('GatewayRunner: GATEWAY_ADMIN_TOKEN set but no ConfigStore — admin disabled')
+    }
+
+    // Dynamic webhook dispatch: resolve the matching connector per request so
+    // hot-added/removed webhook connectors route correctly without a restart.
+    root.all('/*', async (c, next) => {
+      const path = c.req.path
+      for (const connector of this.supervisor.getConnectors()) {
+        if (!isWebhookConnector(connector)) continue
+        const mp = mountPathFor(connector)
+        if (path === mp || path.startsWith(mp + '/')) {
+          const url = new URL(c.req.url)
+          url.pathname = path.slice(mp.length) || '/'
+          return connector.app.fetch(new Request(url, c.req.raw))
+        }
+      }
+      return next()
+    })
+
     this.httpServer = serve({ fetch: root.fetch, port }, (info) => {
       logger.info({ port: info.port }, 'GatewayRunner: HTTP server listening')
     })
-  }
-
-  private wireConnector(connector: ConnectorInterface): void {
-    connector.onMessage((msg) => {
-      if (this.stopped) return
-      runTurn(msg, {
-        connector,
-        adapter: this.adapter,
-        sessionRegistry: this.sessionRegistry,
-        runRegistry: this.runRegistry,
-        auditLog: this.auditLog,
-        config: this.config,
-        approvalMap: this.approvalMap,
-      }).catch((err) => {
-        logger.error(
-          { accountId: connector.accountId, messageId: msg.id, err },
-          'GatewayRunner: unhandled error from runTurn',
-        )
-      })
-    })
-  }
-
-  private async startWithReconnect(connector: ConnectorInterface): Promise<void> {
-    let backoff = RECONNECT_BASE_MS
-    while (!this.stopped) {
-      try {
-        await connector.startAccount()
-        backoff = RECONNECT_BASE_MS // reset on success
-        return
-      } catch (err: unknown) {
-        const isRetryable =
-          err != null &&
-          typeof err === 'object' &&
-          'retryable' in err &&
-          (err as { retryable: boolean }).retryable === true
-
-        if (!isRetryable) {
-          logger.fatal({ accountId: connector.accountId, err }, 'GatewayRunner: fatal connector startup error')
-          process.exit(1)
-        }
-
-        logger.warn(
-          { accountId: connector.accountId, backoffMs: backoff, err },
-          'GatewayRunner: connector startup failed — retrying',
-        )
-        await sleep(backoff)
-        backoff = Math.min(backoff * 2, RECONNECT_MAX_MS)
-      }
-    }
   }
 
   async stop(): Promise<void> {
@@ -178,21 +195,13 @@ export class GatewayRunner {
     logger.info({ shutdownTimeoutMs: this.config.gateway.shutdownTimeoutMs }, 'GatewayRunner: shutting down')
 
     this.httpServer?.close()
+    if (this.httpServer && 'closeAllConnections' in this.httpServer) {
+      (this.httpServer as unknown as { closeAllConnections: () => void }).closeAllConnections()
+    }
 
-    // Stop accepting new messages — connectors will stop their polling loops.
-    await Promise.allSettled(
-      this.connectors.map((c) =>
-        c.stopAccount().catch((err) =>
-          logger.warn({ accountId: c.accountId, err }, 'GatewayRunner: connector stop error'),
-        ),
-      ),
-    )
+    await this.supervisor.stopAll()
 
     this.sessionRegistry.close()
     logger.info('GatewayRunner: shutdown complete')
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }

@@ -92,6 +92,15 @@ const HttpAdapterSchema = z.object({
   url: z.string().url(),
   bearerTokenEnv: z.string().optional(),
   /**
+   * Name of the env var holding an API key. When set, the key is sent as the
+   * `apiKeyHeader` header (default `api-key`) instead of / in addition to a
+   * bearer token. Use for Azure OpenAI / Foundry key auth, which uses a
+   * long-lived `api-key` rather than a short-lived AAD bearer token.
+   */
+  apiKeyEnv: z.string().optional(),
+  /** Header name used to send the API key. Defaults to `api-key` (Azure convention). */
+  apiKeyHeader: z.string().default('api-key'),
+  /**
    * Wire protocol used when posting to the adapter URL.
    *
    * "agent-request"     — POST AgentRequest JSON, expect AgentResponse JSON (default).

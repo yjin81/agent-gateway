@@ -12,7 +12,7 @@ import { ConfigValidationError } from '../lib/errors.js'
  * the config object (deep traversal). Throws ConfigValidationError if any
  * referenced env var is not set.
  */
-function interpolateEnvVars(value: unknown, path: string[] = []): unknown {
+export function interpolateEnvVars(value: unknown, path: string[] = []): unknown {
   if (typeof value === 'string') {
     return value.replace(/\$\{([^}]+)\}/g, (_match, varName: string) => {
       const resolved = process.env[varName]

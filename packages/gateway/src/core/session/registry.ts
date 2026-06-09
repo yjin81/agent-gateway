@@ -75,9 +75,9 @@ export class SessionRegistry {
       }
     }
 
-    // Check idle-timeout
+    // Check idle-timeout OR explicit reset (from /new or /reset command)
     const idleElapsed = now - existing.last_touched_at
-    const wasAutoReset = idleElapsed > idleTimeoutMs
+    const wasAutoReset = idleElapsed > idleTimeoutMs || existing.was_auto_reset === 1
 
     const record: SessionRecord = {
       sessionKey: existing.session_key,
@@ -134,6 +134,30 @@ export class SessionRegistry {
         .run(Date.now(), sessionKey)
     } catch (err) {
       logger.error({ sessionKey, err }, 'SessionRegistry: failed to reset session')
+    }
+  }
+
+  /**
+   * List sessions ordered by most-recently touched (read-only admin view).
+   * Soft read — returns an empty array on failure.
+   */
+  list(limit = 100): SessionRecord[] {
+    try {
+      const rows = this.db
+        .prepare<[number], { session_key: string; created_at: number; last_touched_at: number; is_new: number; was_auto_reset: number }>(
+          'SELECT * FROM sessions ORDER BY last_touched_at DESC LIMIT ?',
+        )
+        .all(limit)
+      return rows.map((r) => ({
+        sessionKey: r.session_key,
+        createdAt: r.created_at,
+        lastTouchedAt: r.last_touched_at,
+        isNew: r.is_new === 1,
+        wasAutoReset: r.was_auto_reset === 1,
+      }))
+    } catch (err) {
+      logger.error({ err }, 'SessionRegistry: failed to list sessions')
+      return []
     }
   }
 
