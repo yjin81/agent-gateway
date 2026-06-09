@@ -55,6 +55,9 @@ agent-gateway/
 ├── data/                         # Runtime data (gitignored)
 │   ├── .env                      # Secrets — never committed
 │   └── gateway.config.yaml       # Active config
+├── start-gateway.ps1             # Local dev: load env + run from source
+├── deploy.ps1                    # Cloud: build → push to ACR → update ACA
+├── bootstrap-aca.ps1             # Cloud: push secrets + enable ingress (one-time)
 └── wechat_login.py               # WeChat iLink QR login script
 ```
 
@@ -80,6 +83,24 @@ A **turn** is one inbound message processed through to response delivery. The pi
 - Node.js 22+
 - pnpm 10+
 - Python 3.11+ (for the reference agent or `wechat_login.py`)
+- Docker Desktop + Azure CLI (`az`) — only for the Docker / Azure Container Apps paths below
+
+---
+
+## Running modes
+
+There are three ways to run the gateway. Pick based on what you're doing:
+
+| Mode | When to use | How | Script |
+|---|---|---|---|
+| **Local (from source)** | Day-to-day development & debugging — fastest inner loop, hot TS via `tsx` | Loads `data/.env`, refreshes `AGENT_TOKEN`, runs `tsx src/index.ts` | [`start-gateway.ps1`](start-gateway.ps1) |
+| **Local Docker** | Verify the production image before shipping | Build + run the image, mounting `data/` | `docker compose up --build` |
+| **Cloud (Azure Container Apps)** | Staging / production / remote debugging | Build → push to ACR → roll a new ACA revision | [`deploy.ps1`](deploy.ps1) + [`bootstrap-aca.ps1`](bootstrap-aca.ps1) |
+
+- **Local debugging** → follow [Setup](#setup) below, then `.\start-gateway.ps1`.
+- **Cloud debugging** → see [Deploying to Azure Container Apps](#deploying-to-azure-container-apps).
+
+The same two inputs drive every mode: `data/gateway.config.yaml` (structure, `${ENV_VAR}` refs only) and the secrets those refs resolve to. Locally the secrets come from `data/.env`; in the cloud they come from Container App secrets.
 
 ---
 
@@ -237,10 +258,10 @@ The gateway resolves its config from `$GATEWAY_DATA_DIR/gateway.config.yaml`. Al
 
 The repo ships a multi-stage [`Dockerfile`](Dockerfile) that produces a small, self-contained runtime image (Node 22, `better-sqlite3` prebuilt) plus a [`docker-compose.yml`](docker-compose.yml) for single-host runs.
 
-The image expects the same two inputs as a local run, both supplied through the mounted `data/` directory:
+The image **bakes in `data/gateway.config.yaml`** at build time (it contains only `${ENV_VAR}` references — no plaintext secrets, which is enforced by `.dockerignore`). At runtime it still needs:
 
-- `data/gateway.config.yaml` — your active config (gitignored; supply your own)
-- `data/.env` — secrets referenced via `${VAR}` interpolation (copy from `data/.env.example`)
+- The secrets the config references via `${VAR}` — supplied as environment variables (`--env-file data/.env` locally, or Container App secrets in the cloud).
+- Optionally a mounted `data/` volume to persist the SQLite session/audit DB and WeChat sync state. **A mount at `/app/data` overrides the baked config** with whatever `gateway.config.yaml` is in the mounted directory.
 
 ### Build
 
@@ -283,6 +304,76 @@ docker compose up --build
 Compose wires the `data/` volume, `--env-file`, port mapping, the `/health` healthcheck, and `restart: unless-stopped` automatically.
 
 > **Note on `AGENT_TOKEN`:** for Azure AD–backed HTTP adapters the token is a short-lived JWT and is *not* suitable for a static `.env`. Refresh it externally (sidecar/secret manager) or use a non-AAD adapter token.
+
+---
+
+## Deploying to Azure Container Apps
+
+Cloud deployment uses two PowerShell scripts at the repo root. **Build/push happens locally** (Docker Desktop), so you don't depend on ACR Tasks.
+
+| Script | Run it | What it does |
+|---|---|---|
+| [`bootstrap-aca.ps1`](bootstrap-aca.ps1) | **Once** (and again only if secrets/ingress change) | Reads `data/.env`, stores each value as a Container App **secret**, maps them to the `${ENV_VAR}` names the baked config expects, and enables external ingress on port 3000 |
+| [`deploy.ps1`](deploy.ps1) | **Every code/config change** | Builds the image locally, pushes to ACR, and updates the Container App — pinned by digest so a new revision always rolls |
+
+### Prerequisites
+
+- Docker Desktop running
+- `az login` completed, with access to the target ACR and Container App
+- `data/.env` populated (same file used for local runs)
+
+### First-time setup
+
+```powershell
+# 1. Push secrets from data/.env + enable ingress on port 3000
+.\bootstrap-aca.ps1
+
+# 2. Build, push, and deploy the image
+.\deploy.ps1
+```
+
+Both scripts default to the `agentgateway` app in resource group `mcptooldemo` and the `gateway4agent` ACR. Override per environment:
+
+```powershell
+.\deploy.ps1 -Registry myacr -ResourceGroup my-rg -ContainerApp my-app -Tag v1.2.0
+.\bootstrap-aca.ps1 -ResourceGroup my-rg -ContainerApp my-app -TargetPort 3000
+```
+
+Useful flags:
+
+- `.\deploy.ps1 -SkipBuild` — reuse the local image, just push + update.
+- `.\bootstrap-aca.ps1 -SkipIngress` — update secrets only, leave ingress untouched.
+
+### Day-to-day cloud loop
+
+After the one-time bootstrap, every change is a single command:
+
+```powershell
+.\deploy.ps1
+```
+
+### Verifying & debugging a deployment
+
+The scripts print the new revision and (for bootstrap) the ingress FQDN. To inspect a running deployment:
+
+```powershell
+# Revision health (look for Running / Healthy)
+az containerapp revision list -g mcptooldemo -n agentgateway -o table
+
+# Live logs — the gateway logs each pipeline stage at debug level
+az containerapp logs show -g mcptooldemo -n agentgateway --tail 50 --type console --follow
+```
+
+Common startup failures and what they mean:
+
+| Log message | Cause | Fix |
+|---|---|---|
+| `Failed to read or parse config file` | No config baked in / bad YAML | Rebuild with `.\deploy.ps1` (config is baked from `data/gateway.config.yaml`) |
+| `Config references undefined env var: ${X}` | Secret `X` not set on the app | Add it to `data/.env`, rerun `.\bootstrap-aca.ps1` |
+| `/admin` returns 404 | No `GATEWAY_ADMIN_TOKEN` set | Add it to `data/.env`, rerun `.\bootstrap-aca.ps1` |
+| No public URL | Ingress disabled | Run `.\bootstrap-aca.ps1` (enables ingress on 3000) |
+
+Once ingress is enabled and `GATEWAY_ADMIN_TOKEN` is set, the dashboard is at `https://<fqdn>/admin` (the FQDN is printed by `bootstrap-aca.ps1`). See [Configuration dashboard](#configuration-dashboard).
 
 ---
 
